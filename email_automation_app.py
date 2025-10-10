@@ -8,6 +8,7 @@ from email.mime.image import MIMEImage
 from email.mime.application import MIMEApplication
 import os
 from typing import Dict, List, Tuple, Optional
+import openai
 import time
 import base64
 from datetime import datetime, timedelta
