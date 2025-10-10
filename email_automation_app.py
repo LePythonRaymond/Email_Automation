@@ -8,7 +8,7 @@ from email.mime.image import MIMEImage
 from email.mime.application import MIMEApplication
 import os
 from typing import Dict, List, Tuple, Optional
-import openai
+
 import time
 import base64
 from datetime import datetime, timedelta
@@ -127,7 +127,6 @@ Je reste à votre entière disposition pour tout complément d'information ou po
 
   {logo_section}
 </div>"""
-        self.openai_api_key ="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"
         # Get OpenAI API key from secrets
  #       try:
 #            self.openai_api_key = st.secrets["api_key"]
