@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 
 # Page configuration
 st.set_page_config(
-    page_title="MERCI RAYMOND - Email Automation",
+    page_title="MERCI RAYMOND - Raymongraphe",
     page_icon="🌱",
     layout="wide"
 )
