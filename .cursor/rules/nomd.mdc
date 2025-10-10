@@ -1,0 +1,11 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+---
+description: "Prevents the agent from creating .md files to summarize its work unless explicitly asked."
+alwaysApply: true
+---
+
+Do not write `.md` files to explain or summarize the changes you have made. Only create or modify files that are part of the user's explicit request. Do not generate explanatory markdown files as part of your work, unless I specifically ask for them.
