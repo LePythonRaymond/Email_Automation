@@ -1348,7 +1348,7 @@ def main():
 
                                 # Anti-spam delay (random 8-20 seconds)
                                 if i < len(valid_emails) - 1:  # Don't delay after last email
-                                    time.sleep(random.randint(8, 20))
+                                    time.sleep(random.randint(1, 5))
 
                             server.quit()
 
