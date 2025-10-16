@@ -11,6 +11,8 @@ from typing import Dict, List, Tuple, Optional
 
 import time
 import base64
+import random
+import html2text
 from datetime import datetime, timedelta
 
 # Page configuration
@@ -463,13 +465,8 @@ def main():
     """)
     st.sidebar.markdown('</div>', unsafe_allow_html=True)
 
-    delay_between_emails = st.sidebar.slider(
-        "Délai entre emails (secondes)",
-        min_value=1,
-        max_value=300,
-        value=10,
-        help="Plus le délai est long, moins vous risquez d'être marqué comme spam"
-    )
+    # Random delay between 8-20 seconds for better anti-spam protection
+    delay_between_emails = random.randint(8, 20)
 
     test_mode = st.sidebar.checkbox(
         "Mode test",
@@ -939,16 +936,18 @@ def main():
                 st.metric("Emails avec problèmes", len(invalid_emails))
             with col3:
                 if valid_emails:
-                    sending_time = calculate_sending_time(len(valid_contacts), delay_between_emails)
+                    # Use average delay (14 seconds) for time estimation
+                    avg_delay = 14
+                    sending_time = calculate_sending_time(len(valid_contacts), avg_delay)
                     st.metric("Temps d'envoi", sending_time)
 
             # Anti-spam recommendations
             st.markdown(f"""
             **🛡️ Configuration anti-spam active :**
-            - ⏱️ Délai entre emails : {delay_between_emails} secondes
+            - ⏱️ Délai entre emails : 8-20 secondes (aléatoire)
             - 🧪 Mode test : {'Activé (5 emails max)' if test_mode else 'Désactivé'}
             - 📧 Emails à envoyer : {len(valid_contacts)}
-            - ⏰ Temps total estimé : {calculate_sending_time(len(valid_contacts), delay_between_emails)}
+            - ⏰ Temps total estimé : {calculate_sending_time(len(valid_contacts), 14)}
             """)
             st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1105,6 +1104,12 @@ def main():
                                         if cc_emails and cc_emails.strip():
                                             msg['Cc'] = cc_emails.strip()
 
+                                        # Generate plain text version from HTML
+                                        plain_text = html2text.html2text(email_data['personalized_email'])
+
+                                        # Add plain text first (for spam filters and accessibility)
+                                        msg.attach(MIMEText(plain_text, 'plain', 'utf-8'))
+
                                         # Add Gmail-style HTML body
                                         msg.attach(MIMEText(email_data['personalized_email'], 'html', 'utf-8'))
 
@@ -1173,9 +1178,9 @@ def main():
 
                                     progress_bar_invalid.progress((i + 1) / len(validated_emails))
 
-                                    # Anti-spam delay
+                                    # Anti-spam delay (random 8-20 seconds)
                                     if i < len(validated_emails) - 1:
-                                        time.sleep(delay_between_emails)
+                                        time.sleep(random.randint(8, 20))
 
                                 server.quit()
 
@@ -1266,6 +1271,12 @@ def main():
                                     if cc_emails and cc_emails.strip():
                                         msg['Cc'] = cc_emails.strip()
 
+                                    # Generate plain text version from HTML
+                                    plain_text = html2text.html2text(email_data['personalized_email'])
+
+                                    # Add plain text first (for spam filters and accessibility)
+                                    msg.attach(MIMEText(plain_text, 'plain', 'utf-8'))
+
                                     # Add Gmail-style HTML body
                                     msg.attach(MIMEText(email_data['personalized_email'], 'html', 'utf-8'))
 
@@ -1335,9 +1346,9 @@ def main():
 
                                 progress_bar.progress((i + 1) / len(valid_emails))
 
-                                # Anti-spam delay
+                                # Anti-spam delay (random 8-20 seconds)
                                 if i < len(valid_emails) - 1:  # Don't delay after last email
-                                    time.sleep(delay_between_emails)
+                                    time.sleep(random.randint(8, 20))
 
                             server.quit()
 
