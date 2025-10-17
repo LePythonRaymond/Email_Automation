@@ -465,8 +465,48 @@ def main():
     """)
     st.sidebar.markdown('</div>', unsafe_allow_html=True)
 
-    # Random delay between 8-20 seconds for better anti-spam protection
-    delay_between_emails = random.randint(8, 20)
+    # Anti-spam delay configuration
+    st.sidebar.subheader("⏱️ Délai entre emails")
+    
+    delay_mode = st.sidebar.radio(
+        "Mode de délai:",
+        ["Délai fixe", "Délai aléatoire"],
+        help="Choisissez entre un délai fixe ou un délai aléatoire entre deux valeurs"
+    )
+    
+    if delay_mode == "Délai fixe":
+        delay_between_emails = st.sidebar.slider(
+            "Délai fixe (secondes)",
+            min_value=1,
+            max_value=300,
+            value=10,
+            help="Délai constant entre chaque email"
+        )
+    else:  # Délai aléatoire
+        col1, col2 = st.sidebar.columns(2)
+        with col1:
+            min_delay = st.number_input(
+                "Min (secondes)",
+                min_value=1,
+                max_value=300,
+                value=8,
+                help="Délai minimum"
+            )
+        with col2:
+            max_delay = st.number_input(
+                "Max (secondes)",
+                min_value=1,
+                max_value=300,
+                value=20,
+                help="Délai maximum"
+            )
+        
+        # Validate that max >= min
+        if max_delay < min_delay:
+            st.sidebar.error("⚠️ Le délai maximum doit être >= au délai minimum")
+            max_delay = min_delay
+        
+        delay_between_emails = f"{min_delay}-{max_delay}"  # Store as range for display
 
     test_mode = st.sidebar.checkbox(
         "Mode test",
@@ -936,18 +976,25 @@ def main():
                 st.metric("Emails avec problèmes", len(invalid_emails))
             with col3:
                 if valid_emails:
-                    # Use average delay (14 seconds) for time estimation
-                    avg_delay = 14
-                    sending_time = calculate_sending_time(len(valid_contacts), avg_delay)
+                    # Calculate time estimation based on delay mode
+                    if delay_mode == "Délai fixe":
+                        estimated_delay = delay_between_emails
+                    else:  # Délai aléatoire
+                        estimated_delay = (min_delay + max_delay) / 2  # Average
+                    
+                    sending_time = calculate_sending_time(len(valid_contacts), estimated_delay)
                     st.metric("Temps d'envoi", sending_time)
 
             # Anti-spam recommendations
+            delay_display = f"{delay_between_emails} secondes" if delay_mode == "Délai fixe" else f"{min_delay}-{max_delay} secondes (aléatoire)"
+            estimated_delay = delay_between_emails if delay_mode == "Délai fixe" else (min_delay + max_delay) / 2
+            
             st.markdown(f"""
             **🛡️ Configuration anti-spam active :**
-            - ⏱️ Délai entre emails : 8-20 secondes (aléatoire)
+            - ⏱️ Délai entre emails : {delay_display}
             - 🧪 Mode test : {'Activé (5 emails max)' if test_mode else 'Désactivé'}
             - 📧 Emails à envoyer : {len(valid_contacts)}
-            - ⏰ Temps total estimé : {calculate_sending_time(len(valid_contacts), 14)}
+            - ⏰ Temps total estimé : {calculate_sending_time(len(valid_contacts), estimated_delay)}
             """)
             st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1178,9 +1225,12 @@ def main():
 
                                     progress_bar_invalid.progress((i + 1) / len(validated_emails))
 
-                                    # Anti-spam delay (random 8-20 seconds)
+                                    # Anti-spam delay
                                     if i < len(validated_emails) - 1:
-                                        time.sleep(1)
+                                        if delay_mode == "Délai fixe":
+                                            time.sleep(delay_between_emails)
+                                        else:  # Délai aléatoire
+                                            time.sleep(random.randint(min_delay, max_delay))
 
                                 server.quit()
 
@@ -1346,9 +1396,12 @@ def main():
 
                                 progress_bar.progress((i + 1) / len(valid_emails))
 
-                                # Anti-spam delay (random 8-20 seconds)
+                                # Anti-spam delay
                                 if i < len(valid_emails) - 1:  # Don't delay after last email
-                                    time.sleep(1)
+                                    if delay_mode == "Délai fixe":
+                                        time.sleep(delay_between_emails)
+                                    else:  # Délai aléatoire
+                                        time.sleep(random.randint(min_delay, max_delay))
 
                             server.quit()
 
