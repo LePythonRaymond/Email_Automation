@@ -150,6 +150,12 @@ Je reste à votre entière disposition pour tout complément d'information ou po
             r'adresse.*mail', r'contact.*mail', r'email.*address', r'electronic.*mail'
         ]
 
+        # Full name detection patterns
+        full_name_patterns = [
+            r'name', r'nom', r'full.*name', r'nom.*complet', r'contact.*name',
+            r'client.*name', r'utilisateur', r'user.*name', r'prenom.*nom'
+        ]
+
         # Find email column
         email_column = None
         best_score = 0
@@ -164,19 +170,37 @@ Je reste à votre entière disposition pour tout complément d'information ou po
                         best_score = score
                         email_column = col
 
+        # Find full name columns
+        full_name_columns = []
+        for col in columns:
+            col_lower = col.lower().strip()
+            for pattern in full_name_patterns:
+                if re.search(pattern, col_lower) and col != email_column:
+                    # Check if column contains full names (has spaces)
+                    sample_values = df[col].dropna().astype(str).head(5)
+                    if any(' ' in str(val) for val in sample_values):
+                        full_name_columns.append(col)
+                        break
+
         # Create available placeholders (all columns except email)
         available_placeholders = {}
         for col in columns:
             if col != email_column:
                 available_placeholders[col] = col
+                
+                # Add first name and last name placeholders for full name columns
+                if col in full_name_columns:
+                    available_placeholders[f"{col}_first"] = f"{col}_first"
+                    available_placeholders[f"{col}_last"] = f"{col}_last"
 
         return {
             'email_column': email_column,
             'available_placeholders': available_placeholders,
+            'full_name_columns': full_name_columns,
             'all_columns': columns
         }
 
-    def extract_contact_info(self, row: pd.Series, email_column: str, available_placeholders: Dict[str, str]) -> Dict[str, str]:
+    def extract_contact_info(self, row: pd.Series, email_column: str, available_placeholders: Dict[str, str], full_name_columns: List[str] = None) -> Dict[str, str]:
         """Extract all contact information from a row dynamically."""
         info = {}
 
@@ -195,6 +219,23 @@ Je reste à votre entière disposition pour tout complément d'information ou po
                 else:
                     info[col_name] = ''
 
+        # Extract first name and last name from full name columns
+        if full_name_columns:
+            for full_name_col in full_name_columns:
+                if full_name_col in row.index and pd.notna(row[full_name_col]):
+                    full_name = str(row[full_name_col]).strip()
+                    name_parts = full_name.split()
+                    
+                    # Add first name (first part)
+                    if len(name_parts) > 0:
+                        info[f"{full_name_col}_first"] = name_parts[0]
+                    
+                    # Add last name (all parts after first, joined)
+                    if len(name_parts) > 1:
+                        info[f"{full_name_col}_last"] = ' '.join(name_parts[1:])
+                    else:
+                        info[f"{full_name_col}_last"] = ''
+
         return info
 
     def get_valid_emails_from_df(self, df: pd.DataFrame) -> List[Dict[str, str]]:
@@ -205,11 +246,12 @@ Je reste à votre entière disposition pour tout complément d'information ou po
         mapping = self.detect_column_mapping(df)
         email_column = mapping['email_column']
         available_placeholders = mapping['available_placeholders']
+        full_name_columns = mapping['full_name_columns']
 
         valid_contacts = []
 
         for idx, row in df.iterrows():
-            contact_info = self.extract_contact_info(row, email_column, available_placeholders)
+            contact_info = self.extract_contact_info(row, email_column, available_placeholders, full_name_columns)
 
             # Check if we have a valid email
             if contact_info.get('email') and re.search(email_pattern, contact_info['email']):
@@ -467,13 +509,13 @@ def main():
 
     # Anti-spam delay configuration
     st.sidebar.subheader("⏱️ Délai entre emails")
-    
+
     delay_mode = st.sidebar.radio(
         "Mode de délai:",
         ["Délai fixe", "Délai aléatoire"],
         help="Choisissez entre un délai fixe ou un délai aléatoire entre deux valeurs"
     )
-    
+
     if delay_mode == "Délai fixe":
         delay_between_emails = st.sidebar.slider(
             "Délai fixe (secondes)",
@@ -500,12 +542,12 @@ def main():
                 value=20,
                 help="Délai maximum"
             )
-        
+
         # Validate that max >= min
         if max_delay < min_delay:
             st.sidebar.error("⚠️ Le délai maximum doit être >= au délai minimum")
             max_delay = min_delay
-        
+
         delay_between_emails = f"{min_delay}-{max_delay}"  # Store as range for display
 
     test_mode = st.sidebar.checkbox(
@@ -552,6 +594,7 @@ def main():
                 mapping = st.session_state.email_automation.detect_column_mapping(df)
                 email_column = mapping['email_column']
                 available_placeholders = mapping['available_placeholders']
+                full_name_columns = mapping['full_name_columns']
                 all_columns = mapping['all_columns']
 
                 st.subheader("🔍 Détection automatique des colonnes")
@@ -570,8 +613,32 @@ def main():
                     # Show all available placeholders
                     if available_placeholders:
                         st.write("**Placeholders disponibles:**")
+                        
+                        # Group placeholders by type
+                        regular_placeholders = []
+                        name_placeholders = {}
+                        
                         for col_name in available_placeholders.keys():
+                            if col_name.endswith('_first') or col_name.endswith('_last'):
+                                base_name = col_name.replace('_first', '').replace('_last', '')
+                                if base_name not in name_placeholders:
+                                    name_placeholders[base_name] = {'first': None, 'last': None, 'full': None}
+                                
+                                if col_name.endswith('_first'):
+                                    name_placeholders[base_name]['first'] = col_name
+                                elif col_name.endswith('_last'):
+                                    name_placeholders[base_name]['last'] = col_name
+                            else:
+                                regular_placeholders.append(col_name)
+                        
+                        # Show regular placeholders
+                        for col_name in regular_placeholders:
                             st.write(f"- `{{{col_name}}}`")
+                        
+                        # Show name placeholders in groups
+                        for base_name, placeholders in name_placeholders.items():
+                            if placeholders['first'] and placeholders['last']:
+                                st.write(f"- **{base_name}:** `{{{base_name}}}` (nom complet), `{{{placeholders['first']}}}` (prénom), `{{{placeholders['last']}}}` (nom de famille)")
                     else:
                         st.write("**Placeholders:** Aucun (seulement email)")
 
@@ -664,16 +731,47 @@ def main():
             if st.session_state.df is not None:
                 mapping = st.session_state.email_automation.detect_column_mapping(st.session_state.df)
                 available_placeholders = mapping['available_placeholders']
+                full_name_columns = mapping['full_name_columns']
 
                 if available_placeholders:
-                    placeholder_list = ", ".join([f"`{{{col}}}`" for col in available_placeholders.keys()])
-                    st.markdown(f"""
-                    **Placeholders disponibles depuis votre Excel :**
-                    {placeholder_list}
-
-                    **Placeholders spéciaux :**
-                    - `{{contact_name}}` : Remplacé par le prénom du contact
-                    """)
+                    # Group placeholders by type
+                    regular_placeholders = []
+                    name_placeholders = {}
+                    
+                    for col_name in available_placeholders.keys():
+                        if col_name.endswith('_first') or col_name.endswith('_last'):
+                            base_name = col_name.replace('_first', '').replace('_last', '')
+                            if base_name not in name_placeholders:
+                                name_placeholders[base_name] = {'first': None, 'last': None, 'full': None}
+                            
+                            if col_name.endswith('_first'):
+                                name_placeholders[base_name]['first'] = col_name
+                            elif col_name.endswith('_last'):
+                                name_placeholders[base_name]['last'] = col_name
+                        else:
+                            regular_placeholders.append(col_name)
+                    
+                    # Build placeholder display
+                    placeholder_text = "**Placeholders disponibles depuis votre Excel :**\n\n"
+                    
+                    # Regular placeholders
+                    if regular_placeholders:
+                        placeholder_text += "**Colonnes normales :**\n"
+                        for col in regular_placeholders:
+                            placeholder_text += f"- `{{{col}}}`\n"
+                        placeholder_text += "\n"
+                    
+                    # Name placeholders
+                    if name_placeholders:
+                        placeholder_text += "**Colonnes de noms (avec options prénom/nom) :**\n"
+                        for base_name, placeholders in name_placeholders.items():
+                            if placeholders['first'] and placeholders['last']:
+                                placeholder_text += f"- **{base_name}:** `{{{base_name}}}` (nom complet), `{{{placeholders['first']}}}` (prénom), `{{{placeholders['last']}}}` (nom de famille)\n"
+                    
+                    placeholder_text += "\n**Placeholders spéciaux :**\n"
+                    placeholder_text += "- `{contact_name}` : Remplacé par le prénom du contact"
+                    
+                    st.markdown(placeholder_text)
                 else:
                     st.markdown("""
                     **Placeholders spéciaux :**
@@ -731,7 +829,7 @@ def main():
 
         # Show header/footer help
         with st.expander("💡 Aide pour l'en-tête et la signature"):
-            st.markdown("""
+            help_text = """
             **Placeholders disponibles pour l'en-tête et la signature :**
 
             - `{contact_name}` : Prénom du contact
@@ -748,7 +846,48 @@ def main():
             - `Bien cordialement,\nVotre nom`
             - `Cordialement,\n{contact_name} de l'équipe MERCI RAYMOND`
             - `Avec mes salutations distinguées,\nVotre équipe`
-            """)
+            """
+            
+            # Add dynamic placeholders if Excel file is uploaded
+            if st.session_state.df is not None:
+                mapping = st.session_state.email_automation.detect_column_mapping(st.session_state.df)
+                available_placeholders = mapping['available_placeholders']
+                full_name_columns = mapping['full_name_columns']
+                
+                if available_placeholders:
+                    help_text += "\n\n**Placeholders dynamiques depuis votre Excel :**\n"
+                    
+                    # Group placeholders by type
+                    regular_placeholders = []
+                    name_placeholders = {}
+                    
+                    for col_name in available_placeholders.keys():
+                        if col_name.endswith('_first') or col_name.endswith('_last'):
+                            base_name = col_name.replace('_first', '').replace('_last', '')
+                            if base_name not in name_placeholders:
+                                name_placeholders[base_name] = {'first': None, 'last': None, 'full': None}
+                            
+                            if col_name.endswith('_first'):
+                                name_placeholders[base_name]['first'] = col_name
+                            elif col_name.endswith('_last'):
+                                name_placeholders[base_name]['last'] = col_name
+                        else:
+                            regular_placeholders.append(col_name)
+                    
+                    # Regular placeholders
+                    if regular_placeholders:
+                        help_text += "\n**Colonnes normales :**\n"
+                        for col in regular_placeholders:
+                            help_text += f"- `{{{col}}}`\n"
+                    
+                    # Name placeholders
+                    if name_placeholders:
+                        help_text += "\n**Colonnes de noms (avec options prénom/nom) :**\n"
+                        for base_name, placeholders in name_placeholders.items():
+                            if placeholders['first'] and placeholders['last']:
+                                help_text += f"- **{base_name}:** `{{{base_name}}}` (nom complet), `{{{placeholders['first']}}}` (prénom), `{{{placeholders['last']}}}` (nom de famille)\n"
+            
+            st.markdown(help_text)
 
         st.divider()
 
@@ -981,14 +1120,14 @@ def main():
                         estimated_delay = delay_between_emails
                     else:  # Délai aléatoire
                         estimated_delay = (min_delay + max_delay) / 2  # Average
-                    
+
                     sending_time = calculate_sending_time(len(valid_contacts), estimated_delay)
                     st.metric("Temps d'envoi", sending_time)
 
             # Anti-spam recommendations
             delay_display = f"{delay_between_emails} secondes" if delay_mode == "Délai fixe" else f"{min_delay}-{max_delay} secondes (aléatoire)"
             estimated_delay = delay_between_emails if delay_mode == "Délai fixe" else (min_delay + max_delay) / 2
-            
+
             st.markdown(f"""
             **🛡️ Configuration anti-spam active :**
             - ⏱️ Délai entre emails : {delay_display}
