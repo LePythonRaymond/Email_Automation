@@ -632,8 +632,7 @@ def main():
         help="Envoyer 5 emails de test à votre propre adresse (pas aux clients)"
     )
 
-    # Show system status
-    st.sidebar.success("🔧 Système simple et fiable - Personnalisation robuste")
+
 
     # Show CC status
     if cc_emails and cc_emails.strip():
@@ -740,7 +739,6 @@ def main():
                 # Show user guidance
                 if email_column and available_placeholders:
                     placeholder_list = ", ".join([f"`{{{col}}}`" for col in available_placeholders.keys()])
-                    st.info(f"💡 **Vous pouvez utiliser ces placeholders dans votre email:** {placeholder_list}")
                 elif email_column:
                     st.info("💡 **Email détecté!** Vous pouvez personnaliser vos emails avec les données de cette colonne.")
                 else:
@@ -1104,7 +1102,6 @@ def main():
                                 st.write(f"- {key}: {value}")
 
                     with col2:
-                        st.info("🔧 Personnalisation Gmail-style avec placeholders dynamiques")
                         personalization_method = "Gmail-style"
 
                     if st.button("Générer aperçu"):
@@ -1196,10 +1193,24 @@ def main():
                 # Take first 5 emails but replace recipient addresses with sender's email
                 valid_emails = valid_emails[:5]
                 for email_data in valid_emails:
-                    email_data['original_email'] = email_data['email']  # Keep original for reference
+                    if 'original_email' not in email_data:  # Only modify if not already modified
+                        email_data['original_email'] = email_data['email']  # Keep original for reference
                     email_data['email'] = sender_email  # Replace with sender's email
                 st.info(f"🧪 Mode test activé - 5 emails de test seront envoyés à {sender_email}")
                 st.warning("⚠️ Les emails de test seront envoyés à VOTRE adresse, pas aux destinataires réels")
+            else:
+                # Restore original email addresses when test mode is disabled
+                # First, restore emails in the current valid_emails list
+                for email_data in valid_emails:
+                    if 'original_email' in email_data:
+                        email_data['email'] = email_data['original_email']  # Restore original email
+                        del email_data['original_email']  # Clean up
+
+                # Also restore emails in the full processed_emails list to ensure complete restoration
+                for email_data in processed_emails:
+                    if 'original_email' in email_data:
+                        email_data['email'] = email_data['original_email']  # Restore original email
+                        del email_data['original_email']  # Clean up
 
             col1, col2, col3 = st.columns(3)
             with col1:
