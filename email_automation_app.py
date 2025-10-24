@@ -629,7 +629,7 @@ def main():
 
     test_mode = st.sidebar.checkbox(
         "Mode test",
-        help="Envoyer seulement aux 5 premiers emails pour tester"
+        help="Envoyer 5 emails de test à votre propre adresse (pas aux clients)"
     )
 
     # Show system status
@@ -1193,8 +1193,13 @@ def main():
 
             # Apply test mode filter
             if test_mode:
+                # Take first 5 emails but replace recipient addresses with sender's email
                 valid_emails = valid_emails[:5]
-                st.info("🧪 Mode test activé - Envoi limité aux 5 premiers emails")
+                for email_data in valid_emails:
+                    email_data['original_email'] = email_data['email']  # Keep original for reference
+                    email_data['email'] = sender_email  # Replace with sender's email
+                st.info(f"🧪 Mode test activé - 5 emails de test seront envoyés à {sender_email}")
+                st.warning("⚠️ Les emails de test seront envoyés à VOTRE adresse, pas aux destinataires réels")
 
             col1, col2, col3 = st.columns(3)
             with col1:
@@ -1223,6 +1228,10 @@ def main():
             - 📧 Emails à envoyer : {len(valid_contacts)}
             - ⏰ Temps total estimé : {calculate_sending_time(len(valid_contacts), estimated_delay)}
             """)
+
+            # Add test mode information
+            if test_mode:
+                st.info(f"📧 Test: Les 5 emails seront envoyés à {sender_email}")
             st.markdown('</div>', unsafe_allow_html=True)
 
             if invalid_emails:
@@ -1657,7 +1666,8 @@ def main():
                                 """, unsafe_allow_html=True)
 
                                 if test_mode:
-                                    st.info("🧪 Mode test utilisé - Pensez à désactiver le mode test pour l'envoi complet")
+                                    st.success(f"✅ Mode test utilisé - {sent_count} emails envoyés à {sender_email} (pas aux clients)")
+                                    st.info("💡 Désactivez le mode test pour envoyer aux vrais destinataires")
 
                             if failed_count > 0:
                                 st.error(f"❌ {failed_count} emails ont échoué")
