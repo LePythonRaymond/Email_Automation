@@ -526,7 +526,7 @@ def calculate_sending_time(num_emails: int, delay_seconds: int) -> str:
         return f"{minutes}min"
 
 def main():
-    st.markdown('<h1 class="main-header">🌱 MERCI RAYMOND - Automation Email</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">🌱 MERCI RAYMOND - Raymographe</h1>', unsafe_allow_html=True)
 
     # Initialize session state
     if 'df' not in st.session_state:
