@@ -187,7 +187,7 @@ Je reste à votre entière disposition pour tout complément d'information ou po
         for col in columns:
             if col != email_column:
                 available_placeholders[col] = col
-                
+
                 # Add first name and last name placeholders for full name columns
                 if col in full_name_columns:
                     available_placeholders[f"{col}_first"] = f"{col}_first"
@@ -225,11 +225,11 @@ Je reste à votre entière disposition pour tout complément d'information ou po
                 if full_name_col in row.index and pd.notna(row[full_name_col]):
                     full_name = str(row[full_name_col]).strip()
                     name_parts = full_name.split()
-                    
+
                     # Add first name (first part)
                     if len(name_parts) > 0:
                         info[f"{full_name_col}_first"] = name_parts[0]
-                    
+
                     # Add last name (all parts after first, joined)
                     if len(name_parts) > 1:
                         info[f"{full_name_col}_last"] = ' '.join(name_parts[1:])
@@ -272,7 +272,23 @@ Je reste à votre entière disposition pour tout complément d'information ou po
 
                 valid_contacts.append(contact_data)
 
-        return valid_contacts
+        # Remove duplicates by email address, keeping first occurrence
+        unique_contacts = []
+        seen_emails = set()
+        duplicates_removed = 0
+
+        for contact in valid_contacts:
+            email = contact['email']
+            if email not in seen_emails:
+                unique_contacts.append(contact)
+                seen_emails.add(email)
+            else:
+                duplicates_removed += 1
+
+        # Store duplicate count for display
+        st.session_state.duplicates_removed = duplicates_removed
+
+        return unique_contacts
 
     def encode_image_to_base64(self, image_file) -> Optional[str]:
         """Convert uploaded image to base64 for embedding in HTML"""
@@ -280,6 +296,55 @@ Je reste à votre entière disposition pour tout complément d'information ou po
             return base64.b64encode(image_file.getvalue()).decode()
         except:
             return None
+
+    def compress_image(self, image_file, max_width=1600, quality=82):
+        """Compress image to reduce file size for email sending"""
+        try:
+            from PIL import Image
+            import io
+
+            # Get original image data
+            original_data = image_file.getvalue()
+            original_image = Image.open(io.BytesIO(original_data))
+
+            # Calculate new dimensions maintaining aspect ratio
+            if original_image.width > max_width:
+                ratio = max_width / original_image.width
+                new_height = int(original_image.height * ratio)
+                original_image = original_image.resize((max_width, new_height), Image.Resampling.LANCZOS)
+
+            # Convert to RGB if necessary (for JPEG)
+            if original_image.mode in ('RGBA', 'LA', 'P'):
+                # Create white background for transparency
+                background = Image.new('RGB', original_image.size, (255, 255, 255))
+                if original_image.mode == 'P':
+                    original_image = original_image.convert('RGBA')
+                background.paste(original_image, mask=original_image.split()[-1] if original_image.mode == 'RGBA' else None)
+                original_image = background
+            elif original_image.mode != 'RGB':
+                original_image = original_image.convert('RGB')
+
+            # Save compressed image to BytesIO
+            compressed_buffer = io.BytesIO()
+            original_image.save(compressed_buffer, format='JPEG', quality=quality, optimize=True)
+            compressed_buffer.seek(0)
+
+            # Create new file-like object with compressed data
+            class CompressedImageFile:
+                def __init__(self, data, name):
+                    self._data = data
+                    self.name = name
+                    self.type = 'image/jpeg'
+
+                def getvalue(self):
+                    return self._data
+
+            return CompressedImageFile(compressed_buffer.getvalue(), image_file.name)
+
+        except Exception as e:
+            # If compression fails, return original file
+            print(f"Image compression failed: {e}")
+            return image_file
 
     def convert_markdown_to_html(self, text: str) -> str:
         """Convert markdown-style formatting to HTML for email"""
@@ -327,9 +392,12 @@ Je reste à votre entière disposition pour tout complément d'information ou po
             if logo_file:
                 logo_section = f'<img src="cid:logo" alt="Merci Raymond" style="display:inline-block; height:24px; width:auto; border:0; outline:0; vertical-align:baseline;">'
 
-            # Prepare decorative image section - natural Gmail-style placement
+            # Check if {Image} placeholder exists in content
+            has_image_placeholder = '{Image}' in personalized
+
+            # Prepare decorative image section - only if no {Image} placeholder
             decorative_image_section = ""
-            if decorative_image_file:
+            if decorative_image_file and not has_image_placeholder:
                 decorative_image_section = f'''
                 <div style="margin: 16px 0;">
                 <img src="cid:decorative_image" alt="Image" style="max-width: 100%; height: auto; border:0; outline:0; display: block;">
@@ -366,6 +434,15 @@ Je reste à votre entière disposition pour tout complément d'information ou po
             # Convert markdown-style bold text to HTML
             first_paragraph = self.convert_markdown_to_html(first_paragraph)
             second_paragraph = self.convert_markdown_to_html(second_paragraph)
+
+            # Replace {Image} placeholder with actual image HTML if it exists
+            if has_image_placeholder and decorative_image_file:
+                image_html = f'''
+                <div style="margin: 16px 0;">
+                <img src="cid:decorative_image" alt="Image" style="max-width: 100%; height: auto; border:0; outline:0; display: block;">
+                </div>'''
+                first_paragraph = first_paragraph.replace('{Image}', image_html)
+                second_paragraph = second_paragraph.replace('{Image}', image_html)
 
             # Get custom header and footer from session state
             header_content = st.session_state.get('email_header', 'Bonjour {contact_name}, j\'espère que vous allez bien.')
@@ -613,28 +690,28 @@ def main():
                     # Show all available placeholders
                     if available_placeholders:
                         st.write("**Placeholders disponibles:**")
-                        
+
                         # Group placeholders by type
                         regular_placeholders = []
                         name_placeholders = {}
-                        
+
                         for col_name in available_placeholders.keys():
                             if col_name.endswith('_first') or col_name.endswith('_last'):
                                 base_name = col_name.replace('_first', '').replace('_last', '')
                                 if base_name not in name_placeholders:
                                     name_placeholders[base_name] = {'first': None, 'last': None, 'full': None}
-                                
+
                                 if col_name.endswith('_first'):
                                     name_placeholders[base_name]['first'] = col_name
                                 elif col_name.endswith('_last'):
                                     name_placeholders[base_name]['last'] = col_name
                             else:
                                 regular_placeholders.append(col_name)
-                        
+
                         # Show regular placeholders
                         for col_name in regular_placeholders:
                             st.write(f"- `{{{col_name}}}`")
-                        
+
                         # Show name placeholders in groups
                         for base_name, placeholders in name_placeholders.items():
                             if placeholders['first'] and placeholders['last']:
@@ -651,6 +728,14 @@ def main():
                     st.metric("Emails valides", len(valid_contacts))
                     if len(df) > 0:
                         st.metric("Taux email", f"{len(valid_contacts)/len(df)*100:.1f}%")
+
+                    # Show duplicate removal info
+                    duplicates_removed = st.session_state.get('duplicates_removed', 0)
+                    if duplicates_removed > 0:
+                        st.metric("Doublons retirés", duplicates_removed)
+                        st.info(f"📧 {len(valid_contacts)} emails uniques (dont {duplicates_removed} doublons retirés)")
+                    else:
+                        st.info(f"📧 {len(valid_contacts)} emails uniques")
 
                 # Show user guidance
                 if email_column and available_placeholders:
@@ -731,57 +816,60 @@ def main():
             if st.session_state.df is not None:
                 mapping = st.session_state.email_automation.detect_column_mapping(st.session_state.df)
                 available_placeholders = mapping['available_placeholders']
-                full_name_columns = mapping['full_name_columns']
+                full_name_columns = mapping.get('full_name_columns', [])
 
                 if available_placeholders:
                     # Group placeholders by type
                     regular_placeholders = []
                     name_placeholders = {}
-                    
+
                     for col_name in available_placeholders.keys():
                         if col_name.endswith('_first') or col_name.endswith('_last'):
                             base_name = col_name.replace('_first', '').replace('_last', '')
                             if base_name not in name_placeholders:
                                 name_placeholders[base_name] = {'first': None, 'last': None, 'full': None}
-                            
+
                             if col_name.endswith('_first'):
                                 name_placeholders[base_name]['first'] = col_name
                             elif col_name.endswith('_last'):
                                 name_placeholders[base_name]['last'] = col_name
                         else:
                             regular_placeholders.append(col_name)
-                    
+
                     # Build placeholder display
                     placeholder_text = "**Placeholders disponibles depuis votre Excel :**\n\n"
-                    
+
                     # Regular placeholders
                     if regular_placeholders:
                         placeholder_text += "**Colonnes normales :**\n"
                         for col in regular_placeholders:
                             placeholder_text += f"- `{{{col}}}`\n"
                         placeholder_text += "\n"
-                    
+
                     # Name placeholders
                     if name_placeholders:
                         placeholder_text += "**Colonnes de noms (avec options prénom/nom) :**\n"
                         for base_name, placeholders in name_placeholders.items():
                             if placeholders['first'] and placeholders['last']:
                                 placeholder_text += f"- **{base_name}:** `{{{base_name}}}` (nom complet), `{{{placeholders['first']}}}` (prénom), `{{{placeholders['last']}}}` (nom de famille)\n"
-                    
+
                     placeholder_text += "\n**Placeholders spéciaux :**\n"
-                    placeholder_text += "- `{contact_name}` : Remplacé par le prénom du contact"
-                    
+                    placeholder_text += "- `{contact_name}` : Remplacé par le prénom du contact\n"
+                    placeholder_text += "- `{Image}` : Place l'image décorative à cet endroit (remplace le placement automatique)"
+
                     st.markdown(placeholder_text)
                 else:
                     st.markdown("""
                     **Placeholders spéciaux :**
                     - `{contact_name}` : Remplacé par le prénom du contact
+                    - `{Image}` : Place l'image décorative à cet endroit (remplace le placement automatique)
                     """)
             else:
                 st.markdown("""
                 **Placeholders disponibles :**
                 - `{contact_name}` : Remplacé par le nom du contact
                 - `{site}` : Remplacé par le lieu du contact
+                - `{Image}` : Place l'image décorative à cet endroit (remplace le placement automatique)
 
                 *Chargez un fichier Excel pour voir tous les placeholders disponibles*
                 """)
@@ -847,46 +935,46 @@ def main():
             - `Cordialement,\n{contact_name} de l'équipe MERCI RAYMOND`
             - `Avec mes salutations distinguées,\nVotre équipe`
             """
-            
+
             # Add dynamic placeholders if Excel file is uploaded
             if st.session_state.df is not None:
                 mapping = st.session_state.email_automation.detect_column_mapping(st.session_state.df)
                 available_placeholders = mapping['available_placeholders']
-                full_name_columns = mapping['full_name_columns']
-                
+                full_name_columns = mapping.get('full_name_columns', [])
+
                 if available_placeholders:
                     help_text += "\n\n**Placeholders dynamiques depuis votre Excel :**\n"
-                    
+
                     # Group placeholders by type
                     regular_placeholders = []
                     name_placeholders = {}
-                    
+
                     for col_name in available_placeholders.keys():
                         if col_name.endswith('_first') or col_name.endswith('_last'):
                             base_name = col_name.replace('_first', '').replace('_last', '')
                             if base_name not in name_placeholders:
                                 name_placeholders[base_name] = {'first': None, 'last': None, 'full': None}
-                            
+
                             if col_name.endswith('_first'):
                                 name_placeholders[base_name]['first'] = col_name
                             elif col_name.endswith('_last'):
                                 name_placeholders[base_name]['last'] = col_name
                         else:
                             regular_placeholders.append(col_name)
-                    
+
                     # Regular placeholders
                     if regular_placeholders:
                         help_text += "\n**Colonnes normales :**\n"
                         for col in regular_placeholders:
                             help_text += f"- `{{{col}}}`\n"
-                    
+
                     # Name placeholders
                     if name_placeholders:
                         help_text += "\n**Colonnes de noms (avec options prénom/nom) :**\n"
                         for base_name, placeholders in name_placeholders.items():
                             if placeholders['first'] and placeholders['last']:
                                 help_text += f"- **{base_name}:** `{{{base_name}}}` (nom complet), `{{{placeholders['first']}}}` (prénom), `{{{placeholders['last']}}}` (nom de famille)\n"
-            
+
             st.markdown(help_text)
 
         st.divider()
@@ -1280,36 +1368,39 @@ def main():
                                         display_name = email_data.get('contact_name', email_data.get('Name', email_data.get('Full Name', 'Contact')))
                                         status_text_invalid.text(f"Envoi: {display_name} ({i+1}/{len(validated_emails)})")
 
-                                        # Create email
-                                        msg = MIMEMultipart('alternative')
-                                        msg['From'] = sender_email
-                                        msg['To'] = email_data['email']
-                                        msg['Subject'] = email_subject_invalid
+                                        # Create email with proper MIME structure
+                                        msg_root = MIMEMultipart('mixed')
+                                        msg_root['From'] = sender_email
+                                        msg_root['To'] = email_data['email']
+                                        msg_root['Subject'] = email_subject_invalid
 
                                         # Add CC if specified
                                         if cc_emails and cc_emails.strip():
-                                            msg['Cc'] = cc_emails.strip()
+                                            msg_root['Cc'] = cc_emails.strip()
+
+                                        # Create alternative container for plain text and HTML
+                                        alt = MIMEMultipart('alternative')
+                                        msg_root.attach(alt)
 
                                         # Generate plain text version from HTML
                                         plain_text = html2text.html2text(email_data['personalized_email'])
+                                        alt.attach(MIMEText(plain_text, 'plain', 'utf-8'))
 
-                                        # Add plain text first (for spam filters and accessibility)
-                                        msg.attach(MIMEText(plain_text, 'plain', 'utf-8'))
+                                        # Create related container for HTML and inline images
+                                        rel = MIMEMultipart('related')
+                                        rel.attach(MIMEText(email_data['personalized_email'], 'html', 'utf-8'))
+                                        alt.attach(rel)
 
-                                        # Add Gmail-style HTML body
-                                        msg.attach(MIMEText(email_data['personalized_email'], 'html', 'utf-8'))
-
-                                        # Add images as inline attachments (Gmail-style HTML)
-                                        # Always add images for Gmail-style format
-
-                                        # Add logo as inline attachment
+                                        # Add compressed images as inline attachments
                                         logo_file = st.session_state.get('logo_file', None)
                                         if logo_file:
                                             try:
-                                                logo_attachment = MIMEImage(logo_file.getvalue())
+                                                # Compress logo before attaching
+                                                compressed_logo = st.session_state.email_automation.compress_image(logo_file)
+                                                logo_attachment = MIMEImage(compressed_logo.getvalue())
                                                 logo_attachment.add_header('Content-ID', '<logo>')
-                                                logo_attachment.add_header('Content-Disposition', 'inline', filename='logo.png')
-                                                msg.attach(logo_attachment)
+                                                logo_attachment.add_header('Content-Disposition', 'inline', filename='logo.jpg')
+                                                rel.attach(logo_attachment)
                                             except Exception as e:
                                                 st.warning(f"⚠️ Impossible d'ajouter le logo: {e}")
 
@@ -1317,14 +1408,16 @@ def main():
                                         decorative_image_file = st.session_state.get('decorative_image_file', None)
                                         if decorative_image_file:
                                             try:
-                                                image_attachment = MIMEImage(decorative_image_file.getvalue())
+                                                # Compress decorative image before attaching
+                                                compressed_decorative = st.session_state.email_automation.compress_image(decorative_image_file)
+                                                image_attachment = MIMEImage(compressed_decorative.getvalue())
                                                 image_attachment.add_header('Content-ID', '<decorative_image>')
-                                                image_attachment.add_header('Content-Disposition', 'inline', filename='decorative_image.png')
-                                                msg.attach(image_attachment)
+                                                image_attachment.add_header('Content-Disposition', 'inline', filename='decorative_image.jpg')
+                                                rel.attach(image_attachment)
                                             except Exception as e:
                                                 st.warning(f"⚠️ Impossible d'ajouter l'image décorative: {e}")
 
-                                        # Add regular attachments
+                                        # Add regular attachments to root level
                                         attachment_files = st.session_state.get('attachment_files', [])
                                         if attachment_files:
                                             for attachment_file in attachment_files:
@@ -1340,12 +1433,12 @@ def main():
                                                         'attachment',
                                                         filename=attachment_file.name
                                                     )
-                                                    msg.attach(attachment)
+                                                    msg_root.attach(attachment)
                                                 except Exception as e:
                                                     st.warning(f"⚠️ Impossible de joindre {attachment_file.name}: {e}")
 
                                         # Send email
-                                        text = msg.as_string()
+                                        text = msg_root.as_string()
 
                                         # Prepare recipient list (TO + CC)
                                         recipients = [email_data['email']]
@@ -1450,36 +1543,39 @@ def main():
                                     display_name = email_data.get('contact_name', email_data.get('Name', email_data.get('Full Name', 'Contact')))
                                     status_text.text(f"Envoi: {display_name} ({i+1}/{len(valid_emails)})")
 
-                                    # Create email
-                                    msg = MIMEMultipart('alternative')
-                                    msg['From'] = sender_email
-                                    msg['To'] = email_data['email']
-                                    msg['Subject'] = email_subject
+                                    # Create email with proper MIME structure
+                                    msg_root = MIMEMultipart('mixed')
+                                    msg_root['From'] = sender_email
+                                    msg_root['To'] = email_data['email']
+                                    msg_root['Subject'] = email_subject
 
                                     # Add CC if specified
                                     if cc_emails and cc_emails.strip():
-                                        msg['Cc'] = cc_emails.strip()
+                                        msg_root['Cc'] = cc_emails.strip()
+
+                                    # Create alternative container for plain text and HTML
+                                    alt = MIMEMultipart('alternative')
+                                    msg_root.attach(alt)
 
                                     # Generate plain text version from HTML
                                     plain_text = html2text.html2text(email_data['personalized_email'])
+                                    alt.attach(MIMEText(plain_text, 'plain', 'utf-8'))
 
-                                    # Add plain text first (for spam filters and accessibility)
-                                    msg.attach(MIMEText(plain_text, 'plain', 'utf-8'))
+                                    # Create related container for HTML and inline images
+                                    rel = MIMEMultipart('related')
+                                    rel.attach(MIMEText(email_data['personalized_email'], 'html', 'utf-8'))
+                                    alt.attach(rel)
 
-                                    # Add Gmail-style HTML body
-                                    msg.attach(MIMEText(email_data['personalized_email'], 'html', 'utf-8'))
-
-                                    # Add images as inline attachments (Gmail-style HTML)
-                                    # Always add images for Gmail-style format
-
-                                    # Add logo as inline attachment
+                                    # Add compressed images as inline attachments
                                     logo_file = st.session_state.get('logo_file', None)
                                     if logo_file:
                                         try:
-                                            logo_attachment = MIMEImage(logo_file.getvalue())
+                                            # Compress logo before attaching
+                                            compressed_logo = st.session_state.email_automation.compress_image(logo_file)
+                                            logo_attachment = MIMEImage(compressed_logo.getvalue())
                                             logo_attachment.add_header('Content-ID', '<logo>')
-                                            logo_attachment.add_header('Content-Disposition', 'inline', filename='logo.png')
-                                            msg.attach(logo_attachment)
+                                            logo_attachment.add_header('Content-Disposition', 'inline', filename='logo.jpg')
+                                            rel.attach(logo_attachment)
                                         except Exception as e:
                                             st.warning(f"⚠️ Impossible d'ajouter le logo: {e}")
 
@@ -1487,14 +1583,16 @@ def main():
                                     decorative_image_file = st.session_state.get('decorative_image_file', None)
                                     if decorative_image_file:
                                         try:
-                                            image_attachment = MIMEImage(decorative_image_file.getvalue())
+                                            # Compress decorative image before attaching
+                                            compressed_decorative = st.session_state.email_automation.compress_image(decorative_image_file)
+                                            image_attachment = MIMEImage(compressed_decorative.getvalue())
                                             image_attachment.add_header('Content-ID', '<decorative_image>')
-                                            image_attachment.add_header('Content-Disposition', 'inline', filename='decorative_image.png')
-                                            msg.attach(image_attachment)
+                                            image_attachment.add_header('Content-Disposition', 'inline', filename='decorative_image.jpg')
+                                            rel.attach(image_attachment)
                                         except Exception as e:
                                             st.warning(f"⚠️ Impossible d'ajouter l'image décorative: {e}")
 
-                                    # Add regular attachments
+                                    # Add regular attachments to root level
                                     attachment_files = st.session_state.get('attachment_files', [])
                                     if attachment_files:
                                         for attachment_file in attachment_files:
@@ -1511,12 +1609,12 @@ def main():
                                                     'attachment',
                                                     filename=attachment_file.name
                                                 )
-                                                msg.attach(attachment)
+                                                msg_root.attach(attachment)
                                             except Exception as e:
                                                 st.warning(f"⚠️ Impossible de joindre {attachment_file.name}: {e}")
 
                                     # Send email
-                                    text = msg.as_string()
+                                    text = msg_root.as_string()
 
                                     # Prepare recipient list (TO + CC)
                                     recipients = [email_data['email']]
