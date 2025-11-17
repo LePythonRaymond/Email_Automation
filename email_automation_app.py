@@ -403,24 +403,45 @@ Je reste à votre entière disposition pour tout complément d'information ou po
                 <img src="cid:decorative_image" alt="Image" style="max-width: 100%; height: auto; border:0; outline:0; display: block;">
                 </div>'''
 
-            # Split content into first and second paragraphs for Gmail-style layout
-            paragraphs = personalized.split('\n\n')
+            # Extract header and footer from unified content
+            # Split the personalized content by double newlines to get paragraphs
+            all_paragraphs = personalized.split('\n\n')
 
-            # First paragraph: everything up to the decorative image
+            # Header is typically the first paragraph (greeting/salutation)
+            # Footer is typically the last paragraph (signature/closing)
+            # Content is everything in between
+            if len(all_paragraphs) >= 3:
+                # We have header, content, and footer
+                header_content = all_paragraphs[0]
+                footer_content = all_paragraphs[-1]
+                # Middle paragraphs are the main content (everything between header and footer)
+                content_paragraphs = all_paragraphs[1:-1]
+            elif len(all_paragraphs) == 2:
+                # Two paragraphs: assume first is header, second is content
+                header_content = all_paragraphs[0]
+                footer_content = ""  # No separate footer
+                content_paragraphs = all_paragraphs[1:]
+            else:
+                # Single paragraph: treat as content only
+                header_content = ""
+                footer_content = ""
+                content_paragraphs = all_paragraphs
+
+            # Split content paragraphs into first and second paragraphs for Gmail-style layout
             first_paragraph = ""
             second_paragraph = ""
 
-            if len(paragraphs) >= 3:
-                # Split after the first two paragraphs for better balance
-                first_paragraph = paragraphs[0] + "\n\n" + paragraphs[1]
-                second_paragraph = "\n\n".join(paragraphs[2:])
-            elif len(paragraphs) >= 2:
-                # Split after the first paragraph
-                first_paragraph = paragraphs[0]
-                second_paragraph = "\n\n".join(paragraphs[1:])
+            if len(content_paragraphs) >= 2:
+                # Split after the first paragraph for better balance
+                first_paragraph = content_paragraphs[0]
+                second_paragraph = "\n\n".join(content_paragraphs[1:])
+            elif len(content_paragraphs) == 1:
+                # Single content paragraph
+                first_paragraph = content_paragraphs[0]
+                second_paragraph = ""
             else:
-                # If we can't split naturally, put most content in first paragraph
-                first_paragraph = personalized
+                # No content paragraphs
+                first_paragraph = ""
                 second_paragraph = ""
 
             # Clean up the paragraphs and ensure proper line breaks
@@ -444,25 +465,9 @@ Je reste à votre entière disposition pour tout complément d'information ou po
                 first_paragraph = first_paragraph.replace('{Image}', image_html)
                 second_paragraph = second_paragraph.replace('{Image}', image_html)
 
-            # Get custom header and footer from session state
-            header_content = st.session_state.get('email_header', 'Bonjour {contact_name}, j\'espère que vous allez bien.')
-            footer_content = st.session_state.get('email_footer', 'Bien cordialement,\nSalomé Cremona')
-
-            # Process header and footer with placeholders
-            header_processed = header_content
-            footer_processed = footer_content
-
-            # Replace placeholders in header and footer
-            for key, value in contact_data.items():
-                if key != 'email' and key != 'index':
-                    placeholder = f"{{{key}}}"
-                    replacement_value = value if value else ""
-                    header_processed = header_processed.replace(placeholder, replacement_value)
-                    footer_processed = footer_processed.replace(placeholder, replacement_value)
-
-            # Replace {contact_name} in header and footer
-            header_processed = header_processed.replace('{contact_name}', first_name)
-            footer_processed = footer_processed.replace('{contact_name}', first_name)
+            # Process header and footer (they're already personalized, just need HTML formatting)
+            header_processed = header_content.strip()
+            footer_processed = footer_content.strip()
 
             # Convert line breaks to <br> tags for HTML
             header_processed = header_processed.replace('\n', '<br>')
@@ -473,8 +478,8 @@ Je reste à votre entière disposition pour tout complément d'information ou po
             footer_processed = self.convert_markdown_to_html(footer_processed)
 
             # Wrap header and footer in proper HTML paragraphs
-            header_section = f'<p style="margin: 0 0 16px 0;">{header_processed}</p>'
-            footer_section = f'<p style="margin: 0 0 16px 0;">{footer_processed}</p>'
+            header_section = f'<p style="margin: 0 0 16px 0;">{header_processed}</p>' if header_processed else ''
+            footer_section = f'<p style="margin: 0 0 16px 0;">{footer_processed}</p>' if footer_processed else ''
 
             # Apply Gmail-style HTML template
             personalized = self.html_template.format(
@@ -485,6 +490,34 @@ Je reste à votre entière disposition pour tout complément d'information ou po
                 logo_section=logo_section,
                 decorative_image_section=decorative_image_section
             )
+
+        return personalized
+
+    def personalize_subject(self, contact_data: Dict[str, str], subject: str) -> str:
+        """Personalize email subject with placeholders"""
+        if subject is None:
+            return ""
+
+        # Start with the subject
+        personalized = subject
+
+        # Replace all placeholders dynamically
+        for key, value in contact_data.items():
+            if key != 'email' and key != 'index':  # Skip email and index
+                placeholder = f"{{{key}}}"
+                # Replace with actual value or empty string if missing
+                replacement_value = value if value else ""
+                personalized = personalized.replace(placeholder, replacement_value)
+
+        # Handle special case for contact name (extract first name)
+        contact_name = contact_data.get('contact_name', '')
+        if contact_name and len(contact_name.split()) > 1:
+            first_name = contact_name.split()[0]
+        else:
+            first_name = "Madame/Monsieur"
+
+        # Replace {contact_name} if it exists in the subject
+        personalized = personalized.replace('{contact_name}', first_name)
 
         return personalized
 
@@ -767,7 +800,12 @@ def main():
 
         # Use Gmail-style HTML template
         is_html_format = True
-        base_template = st.session_state.email_automation.base_email_content_html
+        base_content = st.session_state.email_automation.base_email_content_html
+
+        # Create unified default template with header, content, and footer
+        default_header = "Bonjour {contact_name}, j'espère que vous allez bien."
+        default_footer = "Bien cordialement,\nSalomé Cremona"
+        base_template = f"{default_header}\n\n{base_content}\n\n{default_footer}"
 
 
         # Email subject line
@@ -775,7 +813,7 @@ def main():
         email_subject = st.text_input(
             "Objet de l'email:",
             value="MERCI RAYMOND - Votre service paysagiste",
-            help="L'objet de l'email qui apparaîtra dans la boîte de réception",
+            help="L'objet de l'email qui apparaîtra dans la boîte de réception. Vous pouvez utiliser des placeholders comme {contact_name}, {site}, etc.",
             key=f"email_subject_{email_format}"  # Unique key per format
         )
 
@@ -787,12 +825,13 @@ def main():
 
         st.divider()
 
-        # Allow user to modify email content
+        # Unified email content box (header + content + footer)
+        st.subheader("📝 Contenu complet de l'email")
         email_content = st.text_area(
-            "Modifiez le contenu de votre email:",
-            value=base_template,
-            height=300,
-            help="Utilisez {site} comme placeholder pour la personnalisation du lieu. Utilisez **texte en gras** pour le texte en gras et *texte en italique* pour l'italique.",
+            "Écrivez votre email complet (en-tête, contenu et signature):",
+            value=st.session_state.get('custom_email_content', base_template),
+            height=500,
+            help="Écrivez votre email complet ici, incluant l'en-tête (salutation), le contenu principal et la signature. Utilisez des placeholders comme {contact_name}, {site}, etc. Utilisez **texte en gras** pour le texte en gras et *texte en italique* pour l'italique.",
             key=f"email_content_{email_format}"  # Unique key per format
         )
 
@@ -882,101 +921,6 @@ def main():
 
         st.divider()
 
-        # Header and Footer Customization
-        st.subheader("📝 En-tête et Signature personnalisés")
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.write("**📧 En-tête de l'email:**")
-            header_content = st.text_area(
-                "En-tête (salutation):",
-                value=st.session_state.get('email_header', "Bonjour {contact_name}, j'espère que vous allez bien."),
-                height=100,
-                help="Utilisez {contact_name} pour le prénom du contact, ou tout autre placeholder disponible.",
-                key="header_input"
-            )
-
-        with col2:
-            st.write("**✍️ Signature de l'email:**")
-            footer_content = st.text_area(
-                "Signature (formule de politesse):",
-                value=st.session_state.get('email_footer', "Bien cordialement,\nSalomé Cremona"),
-                height=100,
-                help="Votre signature personnalisée. Vous pouvez utiliser des placeholders comme {contact_name}.",
-                key="footer_input"
-            )
-
-        # Store header and footer in session state with different keys
-        if header_content:
-            st.session_state.email_header = header_content
-        if footer_content:
-            st.session_state.email_footer = footer_content
-
-        # Show header/footer help
-        with st.expander("💡 Aide pour l'en-tête et la signature"):
-            help_text = """
-            **Placeholders disponibles pour l'en-tête et la signature :**
-
-            - `{contact_name}` : Prénom du contact
-            - `{Name}` ou `{Full Name}` : Nom complet du contact
-            - `{Company}` ou `{Company Name}` : Nom de l'entreprise
-            - `{Site}` ou `{Location}` : Lieu/site du contact
-
-            **Exemples d'en-têtes :**
-            - `Bonjour {contact_name}, j'espère que vous allez bien.`
-            - `Cher(e) {Name},`
-            - `Madame/Monsieur {contact_name},`
-
-            **Exemples de signatures :**
-            - `Bien cordialement,\nVotre nom`
-            - `Cordialement,\n{contact_name} de l'équipe MERCI RAYMOND`
-            - `Avec mes salutations distinguées,\nVotre équipe`
-            """
-
-            # Add dynamic placeholders if Excel file is uploaded
-            if st.session_state.df is not None:
-                mapping = st.session_state.email_automation.detect_column_mapping(st.session_state.df)
-                available_placeholders = mapping['available_placeholders']
-                full_name_columns = mapping.get('full_name_columns', [])
-
-                if available_placeholders:
-                    help_text += "\n\n**Placeholders dynamiques depuis votre Excel :**\n"
-
-                    # Group placeholders by type
-                    regular_placeholders = []
-                    name_placeholders = {}
-
-                    for col_name in available_placeholders.keys():
-                        if col_name.endswith('_first') or col_name.endswith('_last'):
-                            base_name = col_name.replace('_first', '').replace('_last', '')
-                            if base_name not in name_placeholders:
-                                name_placeholders[base_name] = {'first': None, 'last': None, 'full': None}
-
-                            if col_name.endswith('_first'):
-                                name_placeholders[base_name]['first'] = col_name
-                            elif col_name.endswith('_last'):
-                                name_placeholders[base_name]['last'] = col_name
-                        else:
-                            regular_placeholders.append(col_name)
-
-                    # Regular placeholders
-                    if regular_placeholders:
-                        help_text += "\n**Colonnes normales :**\n"
-                        for col in regular_placeholders:
-                            help_text += f"- `{{{col}}}`\n"
-
-                    # Name placeholders
-                    if name_placeholders:
-                        help_text += "\n**Colonnes de noms (avec options prénom/nom) :**\n"
-                        for base_name, placeholders in name_placeholders.items():
-                            if placeholders['first'] and placeholders['last']:
-                                help_text += f"- **{base_name}:** `{{{base_name}}}` (nom complet), `{{{placeholders['first']}}}` (prénom), `{{{placeholders['last']}}}` (nom de famille)\n"
-
-            st.markdown(help_text)
-
-        st.divider()
-
         # Visual elements section
         st.subheader("🎨 Éléments visuels (optionnels)")
 
@@ -1054,81 +998,32 @@ def main():
             email_format = st.session_state.get('email_format', 'HTML (Gmail-style)')
             is_html_format = True
 
-            # Ensure we always have email content - use Gmail-style template
+            # Ensure we always have email content - use unified template
             if 'custom_email_content' in st.session_state and st.session_state.custom_email_content:
                 # Verify the custom content matches the current format
                 custom_format = st.session_state.get('custom_email_format', email_format)
                 if custom_format == email_format:
                     email_content = st.session_state.custom_email_content
                 else:
-                    # Format changed, use base template for Gmail-style
-                    email_content = st.session_state.email_automation.base_email_content_html
+                    # Format changed, use unified base template
+                    base_content = st.session_state.email_automation.base_email_content_html
+                    default_header = "Bonjour {contact_name}, j'espère que vous allez bien."
+                    default_footer = "Bien cordialement,\nSalomé Cremona"
+                    email_content = f"{default_header}\n\n{base_content}\n\n{default_footer}"
             else:
-                # No custom content, use base template for Gmail-style
-                email_content = st.session_state.email_automation.base_email_content_html
+                # No custom content, use unified base template
+                base_content = st.session_state.email_automation.base_email_content_html
+                default_header = "Bonjour {contact_name}, j'espère que vous allez bien."
+                default_footer = "Bien cordialement,\nSalomé Cremona"
+                email_content = f"{default_header}\n\n{base_content}\n\n{default_footer}"
 
             logo_file = st.session_state.get('logo_file', None)
             decorative_image_file = st.session_state.get('decorative_image_file', None)
-
-            # Determine email formats to generate - always Gmail-style HTML
-            formats_to_generate = [("gmail-style", True)]
 
             valid_contacts = st.session_state.valid_contacts
 
             if valid_contacts:
                 st.info(f"📊 {len(valid_contacts)} emails à traiter")
-
-                # Preview section
-                st.subheader("Aperçu de la personnalisation")
-
-                preview_idx = st.selectbox(
-                    "Choisir un contact pour l'aperçu:",
-                    range(len(valid_contacts)),
-                    format_func=lambda x: f"{valid_contacts[x].get('contact_name', valid_contacts[x].get('Name', 'Contact'))} - {valid_contacts[x].get('site', valid_contacts[x].get('Site', valid_contacts[x].get('Location', 'N/A')))}"
-                )
-
-                if preview_idx is not None:
-                    selected_contact = valid_contacts[preview_idx]
-
-                    col1, col2 = st.columns(2)
-
-                    with col1:
-                        st.write("**Informations du contact:**")
-                        st.write(f"- Email: {selected_contact['email']}")
-
-                        # Show all available data fields dynamically
-                        for key, value in selected_contact.items():
-                            if key not in ['email', 'index']:  # Skip email and index
-                                st.write(f"- {key}: {value}")
-
-                    with col2:
-                        personalization_method = "Gmail-style"
-
-                    if st.button("Générer aperçu"):
-                        st.markdown('<div class="email-preview">', unsafe_allow_html=True)
-
-                        for format_name, use_html in formats_to_generate:
-                            # Always use simple personalization - reliable and bulletproof
-                            personalized_email = st.session_state.email_automation.personalize_email(
-                                selected_contact, email_content, use_html,
-                                logo_file, decorative_image_file,
-                                attachment_files=st.session_state.get('attachment_files', [])
-                            )
-
-                            st.markdown("**📧 Aperçu Gmail-style personnalisé:**")
-
-                            # Always show as HTML for Gmail-style
-                            st.components.v1.html(personalized_email, height=500, scrolling=True)
-
-                            # Verification
-                            is_valid, issues = st.session_state.email_automation.verify_email_content(personalized_email)
-
-                            if is_valid:
-                                st.success("✅ Email Gmail-style validé - Prêt à envoyer")
-                            else:
-                                st.warning("⚠️ Problèmes détectés - Vérifiez le contenu")
-
-                        st.markdown('</div>', unsafe_allow_html=True)
 
                 # Process all emails
                 if st.button("🔄 Traiter tous les emails", type="primary"):
@@ -1392,7 +1287,9 @@ def main():
                                         msg_root = MIMEMultipart('mixed')
                                         msg_root['From'] = sender_email
                                         msg_root['To'] = email_data['email']
-                                        msg_root['Subject'] = email_subject_invalid
+                                        # Personalize subject with placeholders
+                                        personalized_subject = st.session_state.email_automation.personalize_subject(email_data, email_subject_invalid)
+                                        msg_root['Subject'] = personalized_subject
 
                                         # Add CC if specified
                                         if cc_emails and cc_emails.strip():
@@ -1567,7 +1464,9 @@ def main():
                                     msg_root = MIMEMultipart('mixed')
                                     msg_root['From'] = sender_email
                                     msg_root['To'] = email_data['email']
-                                    msg_root['Subject'] = email_subject
+                                    # Personalize subject with placeholders
+                                    personalized_subject = st.session_state.email_automation.personalize_subject(email_data, email_subject)
+                                    msg_root['Subject'] = personalized_subject
 
                                     # Add CC if specified
                                     if cc_emails and cc_emails.strip():
