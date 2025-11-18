@@ -78,43 +78,10 @@ SMTP_PORT = 587
 class EmailAutomation:
     def __init__(self):
         # Base email template for TEXT format (includes greetings and signature)
-        self.base_email_content_text = """Bonjour {contact_name},
-
-Lorsque l'été touche à sa fin et l'hiver arrive à pas feutrés…
-
-Les Raymonds vous emmènent dans leur traîneau et vous proposent une large palette de sapins, décorations et animations afin de préparer l'arrivée des fêtes de fin d'année !
-
-Créez une ambiance unique avec des sapins, robustes et élégants, disponibles de 80 à 200 cm, et décorés selon vos préférences. Découvrez également nos guirlandes sur mesure, faites de branchages et personnalisables.
-
-Vous connaissez les Raymonds, ces décorations 100% végétales seront aussi festives que durables ! Matériaux sourcés & Réemploi en intégralité.
-Remplissez la lettre au père noël jointe à ce mail avec vos désirs de couleurs et vos choix de dimensions, et faisons germer ensemble l'esprit de Noël dans votre {site} !
-
-🎁 Pour l'occasion, nous avons le plaisir d'offrir à nos clients du pôle entretien une réduction spéciale de 10 % sur notre catalogue de Noël.
-
-Je reste à votre entière disposition pour tout complément d'information ou pour une offre sur mesure.
-
-En vous souhaitant une bonne journée,
-
-L'équipe MERCI RAYMOND"""
+        self.base_email_content_text = ""
 
         # Base email template for Gmail-style HTML format (unified with header and footer)
-        self.base_email_content_html = """Bonjour {contact_name}, j'espère que vous allez bien.
-
-Lorsque l'été touche à sa fin et l'hiver arrive à pas feutrés…
-
-Les Raymonds vous emmènent dans leur traîneau et vous proposent une large palette de sapins, décorations et animations afin de préparer l'arrivée des fêtes de fin d'année !
-
-Créez une ambiance unique avec des sapins, robustes et élégants, disponibles de 80 à 200 cm, et décorés selon vos préférences. Découvrez également nos guirlandes sur mesure, faites de branchages et personnalisables.
-
-Vous connaissez les Raymonds, ces décorations 100% végétales seront aussi festives que durables ! Matériaux sourcés & Réemploi en intégralité.
-Remplissez la lettre au père noël jointe à ce mail avec vos désirs de couleurs et vos choix de dimensions, et faisons germer ensemble l'esprit de Noël dans votre {site} !
-
-🎁 **Pour l'occasion**, nous avons le plaisir d'offrir à nos clients du pôle entretien une **réduction spéciale de 10%** sur notre catalogue de Noël.
-
-Je reste à votre entière disposition pour tout complément d'information ou pour une offre sur mesure.
-
-Bien cordialement,
-Salomé Cremona"""
+        self.base_email_content_html = ""
 
         # Gmail-style HTML template that looks like plain text - simplified for unified content
         self.html_template = """<div style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; line-height: 1.4; color: #202124; background: #ffffff; margin: 0; padding: 0;">
@@ -517,111 +484,41 @@ def main():
     if 'validated_invalid_emails' not in st.session_state:
         st.session_state.validated_invalid_emails = []
 
-    # Sidebar for Gmail configuration
-    st.sidebar.header("📧 Configuration Gmail")
+    # Sidebar for user selection
+    st.sidebar.header("👤 Choisissez un Utilisateur")
 
-    # Instructions for Gmail setup
-#    st.sidebar.markdown('<div class="info-box">', unsafe_allow_html=True)
-    st.sidebar.markdown("""
-    **📋 Instructions Gmail :**
-    1. Activez l'authentification à 2 facteurs
-    2. Générez un "Mot de passe d'application"
-    3. Utilisez ce mot de passe ci-dessous
-    """)
-    st.sidebar.markdown('</div>', unsafe_allow_html=True)
+    # Hardcoded user credentials
+    USERS = [
+        {"name": "Salomé Cremona", "email": "salome.cremona@merciraymond.fr", "password": "kosj dkza wuku hlbo"},
+        {"name": "Taddeo Carpinelli", "email": "taddeo.carpinelli@merciraymond.fr", "password": "ucfk qkhc jzmd ubry"}# Add more users as needed
+    ]
 
-    sender_email = st.sidebar.text_input(
-        "Adresse Gmail",
-        placeholder="votre@gmail.com ou votre@merciraymond.fr",
-        help="Votre adresse Gmail ou adresse configurée avec Gmail"
-    )
-    sender_password = st.sidebar.text_input(
-        "Mot de passe d'application Gmail",
-        type="password",
-        help="Généré dans les paramètres de sécurité Gmail, PAS votre mot de passe habituel"
-    )
-
-    # CC email addresses
-    st.sidebar.subheader("📋 CC (optionnel)")
-    cc_emails = st.sidebar.text_input(
-        "Adresses email en copie",
-        placeholder="email1@example.com, email2@example.com",
-        help="Séparez plusieurs adresses par des virgules. Ces emails recevront une copie de tous les emails envoyés."
-    )
-
-    # Anti-spam settings
-    st.sidebar.subheader("🛡️ Protection Anti-spam")
-
-#    st.sidebar.markdown('<div class="anti-spam-box">', unsafe_allow_html=True)
-    st.sidebar.markdown("""
-    **⚠️ Conseils anti-spam :**
-    - Échelonner les envois
-    - Tester d'abord sur quelques emails
-    - Personnaliser au maximum
-    """)
-    st.sidebar.markdown('</div>', unsafe_allow_html=True)
-
-    # Anti-spam delay configuration
-    st.sidebar.subheader("⏱️ Délai entre emails")
-
-    delay_mode = st.sidebar.radio(
-        "Mode de délai:",
-        ["Délai fixe", "Délai aléatoire"],
-        help="Choisissez entre un délai fixe ou un délai aléatoire entre deux valeurs"
-    )
-
-    if delay_mode == "Délai fixe":
-        delay_between_emails = st.sidebar.slider(
-            "Délai fixe (secondes)",
-            min_value=1,
-            max_value=300,
-            value=10,
-            help="Délai constant entre chaque email"
+    # Create user selection dropdown
+    user_options = [user["name"] for user in USERS]
+    if user_options:
+        selected_user_name = st.sidebar.selectbox(
+            "Utilisateur",
+            options=user_options,
+            help="Sélectionnez l'utilisateur pour l'envoi des emails"
         )
-    else:  # Délai aléatoire
-        col1, col2 = st.sidebar.columns(2)
-        with col1:
-            min_delay = st.number_input(
-                "Min (secondes)",
-                min_value=1,
-                max_value=300,
-                value=8,
-                help="Délai minimum"
-            )
-        with col2:
-            max_delay = st.number_input(
-                "Max (secondes)",
-                min_value=1,
-                max_value=300,
-                value=20,
-                help="Délai maximum"
-            )
 
-        # Validate that max >= min
-        if max_delay < min_delay:
-            st.sidebar.error("⚠️ Le délai maximum doit être >= au délai minimum")
-            max_delay = min_delay
-
-        delay_between_emails = f"{min_delay}-{max_delay}"  # Store as range for display
-
-    test_mode = st.sidebar.checkbox(
-        "Mode test",
-        help="Envoyer 5 emails de test à votre propre adresse (pas aux clients)"
-    )
-
-
-
-    # Show CC status
-    if cc_emails and cc_emails.strip():
-        cc_list = [email.strip() for email in cc_emails.split(',') if email.strip()]
-        st.sidebar.info(f"📋 CC configuré: {len(cc_list)} adresse(s)")
-        for cc_email in cc_list:
-            st.sidebar.write(f"  • {cc_email}")
+        # Find selected user and store credentials in session state
+        selected_user = next((user for user in USERS if user["name"] == selected_user_name), None)
+        if selected_user:
+            sender_email = selected_user["email"]
+            sender_password = selected_user["password"]
+            st.session_state.sender_email = sender_email
+            st.session_state.sender_password = sender_password
+        else:
+            sender_email = None
+            sender_password = None
     else:
-        st.sidebar.info("📋 Aucun CC configuré")
+        st.sidebar.warning("Aucun utilisateur configuré")
+        sender_email = None
+        sender_password = None
 
     # Main content
-    tab1, tab2, tab3, tab4 = st.tabs(["📁 Upload & Preview", "🎨 Design Email", "✉️ Personnalisation", "🚀 Envoi"])
+    tab1, tab2, tab3 = st.tabs(["📁 Upload & Preview", "🎨 Design Email", "🚀 Envoi"])
 
     with tab1:
         st.markdown('<h2 class="step-header">Étape 1: Upload du fichier Excel</h2>', unsafe_allow_html=True)
@@ -748,45 +645,31 @@ def main():
 
 
         # Email subject line
-        st.subheader("📝 Objet de l'email")
         email_subject = st.text_input(
             "Objet de l'email:",
-            value="MERCI RAYMOND - Votre service paysagiste",
+            value="",
             help="L'objet de l'email qui apparaîtra dans la boîte de réception. Vous pouvez utiliser des placeholders comme {contact_name}, {Company}, {Site}, etc.",
-            key=f"email_subject_{email_format}"  # Unique key per format
+            key=f"email_subject_{email_format}",  # Unique key per format
+            placeholder=""
         )
 
         # Store email subject in session state
         st.session_state.email_subject = email_subject
-
-        # Show subject line info
-        st.info(f"📧 **Objet configuré:** {email_subject} (les placeholders seront personnalisés pour chaque contact)")
 
         st.divider()
 
         # Allow user to modify email content (unified: header + content + footer)
         email_content = st.text_area(
             "Modifiez le contenu complet de votre email (en-tête, contenu principal, signature):",
-            value=base_template,
+            value="",
             height=400,
             help="Créez votre email complet ici. Utilisez des placeholders comme {contact_name}, {site}, etc. Utilisez **texte en gras** pour le texte en gras et *texte en italique* pour l'italique.",
-            key=f"email_content_{email_format}"  # Unique key per format
+            key=f"email_content_{email_format}",  # Unique key per format
+            placeholder=""
         )
 
         # Show formatting help
         with st.expander("💡 Aide au formatage du texte"):
-            st.markdown("""
-            **Formatage du texte disponible :**
-
-            - **Texte en gras** : Utilisez `**texte en gras**`
-            - *Texte en italique* : Utilisez `*texte en italique*`
-
-            **Exemples :**
-            - `**Offre spéciale**` → **Offre spéciale**
-            - `*Réduction limitée*` → *Réduction limitée*
-            - `**Important** : *Action limitée*` → **Important** : *Action limitée*
-            """)
-
             # Show dynamic placeholders if Excel file is uploaded
             if st.session_state.df is not None:
                 mapping = st.session_state.email_automation.detect_column_mapping(st.session_state.df)
@@ -829,28 +712,25 @@ def main():
                                 placeholder_text += f"- **{base_name}:** `{{{base_name}}}` (nom complet), `{{{placeholders['first']}}}` (prénom), `{{{placeholders['last']}}}` (nom de famille)\n"
 
                     placeholder_text += "\n**Placeholders spéciaux :**\n"
-                    placeholder_text += "- `{contact_name}` : Remplacé par le prénom du contact\n"
                     placeholder_text += "- `{Image}` : Place l'image décorative à cet endroit (remplace le placement automatique)"
 
                     st.markdown(placeholder_text)
                 else:
                     st.markdown("""
                     **Placeholders spéciaux :**
-                    - `{contact_name}` : Remplacé par le prénom du contact
                     - `{Image}` : Place l'image décorative à cet endroit (remplace le placement automatique)
                     """)
             else:
                 st.markdown("""
-                **Placeholders disponibles :**
-                - `{contact_name}` : Remplacé par le nom du contact
-                - `{site}` : Remplacé par le lieu du contact
-                - `{Image}` : Place l'image décorative à cet endroit (remplace le placement automatique)
-
-                *Chargez un fichier Excel pour voir tous les placeholders disponibles*
+                *Chargez un fichier Excel pour voir les placeholders disponibles*
                 """)
 
+            # Formatting explanation and example at the end
+            st.markdown('<p style="margin-top: 1rem;"><strong>Formatage:</strong> Utilisez <code>**texte**</code> pour le gras et <code>*texte*</code> pour l\'italique.</p>', unsafe_allow_html=True)
+            st.markdown('<p style="color: #2196F3; margin-top: 0.5rem;"><strong>Exemple:</strong> <code>**Bonjour**: *{contact_name}*</code> => <strong>Bonjour</strong>: <em>Marie</em></p>', unsafe_allow_html=True)
+
         # Store custom email content with format awareness
-        if email_content != base_template:
+        if email_content and email_content.strip():
             st.session_state.custom_email_content = email_content
             st.session_state.custom_email_format = email_format
         else:
@@ -860,22 +740,11 @@ def main():
         st.divider()
 
         # Visual elements section
-        st.subheader("🎨 Éléments visuels (optionnels)")
-
-        logo_file = st.file_uploader(
-            "Logo de votre entreprise",
-            type=['png', 'jpg', 'jpeg'],
-            help="Logo qui apparaîtra en en-tête de l'email HTML"
-        )
-
         decorative_image_file = st.file_uploader(
             "Image décorative",
             type=['png', 'jpg', 'jpeg'],
             help="Image qui apparaîtra dans le corps de l'email HTML"
         )
-
-        # Nouvelle section pour les pièces jointes
-        st.subheader("📎 Pièces jointes (optionnelles)")
 
         attachment_files = st.file_uploader(
             "Fichiers à joindre",
@@ -885,16 +754,10 @@ def main():
         )
 
         # Store files in session state
-        if 'logo_file' not in st.session_state:
-            st.session_state.logo_file = None
         if 'decorative_image_file' not in st.session_state:
             st.session_state.decorative_image_file = None
         if 'attachment_files' not in st.session_state:
             st.session_state.attachment_files = []
-
-        if logo_file:
-            st.session_state.logo_file = logo_file
-            st.success("✅ Logo chargé")
 
         if decorative_image_file:
             st.session_state.decorative_image_file = decorative_image_file
@@ -912,71 +775,49 @@ def main():
 
         # Show Gmail-style HTML preview
         st.write("**📧 Aperçu Gmail-style:**")
-        # Create sample contact data for preview
-        sample_contact = {
-            'contact_name': 'Marie Dupont',
-            'Site': 'Bureau Paris',
-            'Company': 'Entreprise ABC'
-        }
+
+        # Use actual first contact data if available, otherwise use placeholder data
+        if st.session_state.df is not None and hasattr(st.session_state, 'valid_contacts') and st.session_state.valid_contacts:
+            sample_contact = st.session_state.valid_contacts[0].copy()
+        else:
+            # Fallback to placeholder data
+            sample_contact = {
+                'contact_name': 'Marie Dupont',
+                'Site': 'Bureau Paris',
+                'Company': 'Entreprise ABC'
+            }
+
         sample_html, sample_subject = st.session_state.email_automation.personalize_email(
-                sample_contact, email_content, use_html=True,
-                logo_file=st.session_state.logo_file,
+                sample_contact, email_content if email_content else "", use_html=True,
+                logo_file=None,
             decorative_image_file=st.session_state.decorative_image_file,
             attachment_files=st.session_state.get('attachment_files', []),
-            email_subject=email_subject
+            email_subject=email_subject if email_subject else ""
             )
-        st.info(f"📧 **Objet personnalisé:** {sample_subject}")
-        st.components.v1.html(sample_html, height=500, scrolling=True)
+        st.markdown(f'<p style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; line-height: 1.4; color: #202124; margin: 0 0 16px 0;"><strong>Objet:</strong> {sample_subject}</p>', unsafe_allow_html=True)
+        st.components.v1.html(sample_html, height=300, scrolling=True)
 
-
-
-    with tab3:
-        st.markdown('<h2 class="step-header">Étape 3: Personnalisation des emails</h2>', unsafe_allow_html=True)
+        # Add "Valider" button for personalization - right after preview
+        st.markdown("<br>", unsafe_allow_html=True)
 
         if st.session_state.df is not None and hasattr(st.session_state, 'valid_contacts'):
-            # Get settings from previous tab - always Gmail-style HTML
-            email_format = st.session_state.get('email_format', 'HTML (Gmail-style)')
-            is_html_format = True
-
-            # Ensure we always have email content - use Gmail-style template
-            if 'custom_email_content' in st.session_state and st.session_state.custom_email_content:
-                # Verify the custom content matches the current format
-                custom_format = st.session_state.get('custom_email_format', email_format)
-                if custom_format == email_format:
-                    email_content = st.session_state.custom_email_content
-                else:
-                    # Format changed, use base template for Gmail-style
-                    email_content = st.session_state.email_automation.base_email_content_html
-            else:
-                # No custom content, use base template for Gmail-style
-                email_content = st.session_state.email_automation.base_email_content_html
-
-            logo_file = st.session_state.get('logo_file', None)
-            decorative_image_file = st.session_state.get('decorative_image_file', None)
-
-            # Determine email formats to generate - always Gmail-style HTML
-            formats_to_generate = [("gmail-style", True)]
-
             valid_contacts = st.session_state.valid_contacts
 
             if valid_contacts:
-                st.info(f"📊 {len(valid_contacts)} emails à traiter")
+                # Get email content and subject from current tab
+                # Use custom content if available, otherwise use what's in the text area
+                if 'custom_email_content' in st.session_state and st.session_state.custom_email_content:
+                    email_content_for_processing = st.session_state.custom_email_content
+                else:
+                    email_content_for_processing = email_content if email_content else ""
 
-                # Information about personalization
-                st.markdown("""
-                **💡 Personnalisation des emails:**
+                email_subject_for_processing = email_subject if email_subject else ""
 
-                Cliquez sur le bouton ci-dessous pour personnaliser tous les emails avec les données de votre fichier Excel.
-                Les placeholders seront remplacés par les valeurs correspondantes pour chaque contact.
-                """)
-
-                # Process all emails
-                if st.button("🔄 Personnaliser tous les emails", type="primary"):
+                if st.button("Valider", type="primary"):
                     # Always use Gmail-style HTML
                     use_html_for_processing = True
 
-                    # Get email subject from session state
-                    email_subject = st.session_state.get('email_subject', 'MERCI RAYMOND - Votre service paysagiste')
+                    decorative_image_file_for_processing = st.session_state.get('decorative_image_file', None)
 
                     progress_bar = st.progress(0)
                     status_text = st.empty()
@@ -990,10 +831,10 @@ def main():
 
                         # Always use simple personalization - reliable and bulletproof
                         personalized, personalized_subject = st.session_state.email_automation.personalize_email(
-                            contact_data, email_content, use_html_for_processing,
-                            logo_file, decorative_image_file,
+                            contact_data, email_content_for_processing, use_html_for_processing,
+                            logo_file=None, decorative_image_file=decorative_image_file_for_processing,
                             attachment_files=st.session_state.get('attachment_files', []),
-                            email_subject=email_subject
+                            email_subject=email_subject_for_processing
                         )
 
                         is_valid, issues = st.session_state.email_automation.verify_email_content(personalized)
@@ -1019,14 +860,33 @@ def main():
 
                     if valid_count < len(processed_emails):
                         st.warning(f"⚠️ {len(processed_emails) - valid_count} emails nécessitent une révision")
-
             else:
                 st.warning("Aucun email valide trouvé dans le fichier.")
         else:
             st.info("Veuillez d'abord charger un fichier Excel dans l'onglet 'Upload & Preview'.")
 
-    with tab4:
-        st.markdown('<h2 class="step-header">Étape 4: Envoi des emails</h2>', unsafe_allow_html=True)
+    with tab3:
+        st.markdown('<h2 class="step-header">Étape 3: Envoi des emails</h2>', unsafe_allow_html=True)
+
+        # CC email addresses
+        st.subheader("📋 CC (optionnel)")
+        cc_emails = st.text_input(
+            "Adresses email en copie",
+            placeholder="email1@example.com, email2@example.com",
+            help="Séparez plusieurs adresses par des virgules. Ces emails recevront une copie de tous les emails envoyés."
+        )
+
+        # Test mode checkbox
+        test_mode = st.checkbox(
+            "Mode test",
+            help="Envoyer 5 emails de test à votre propre adresse (pas aux clients)"
+        )
+
+        st.divider()
+
+        # Get sender credentials from session state
+        sender_email = st.session_state.get('sender_email', None)
+        sender_password = st.session_state.get('sender_password', None)
 
         if st.session_state.processed_emails:
             processed_emails = st.session_state.processed_emails
@@ -1057,38 +917,32 @@ def main():
                         email_data['email'] = email_data['original_email']  # Restore original email
                         del email_data['original_email']  # Clean up
 
+            # Get valid_contacts count
+            valid_contacts_count = len(st.session_state.valid_contacts) if hasattr(st.session_state, 'valid_contacts') else len(valid_emails)
+
             col1, col2, col3 = st.columns(3)
             with col1:
-                st.metric("Emails prêts", len(valid_contacts))
+                st.metric("Emails prêts", valid_contacts_count)
             with col2:
                 st.metric("Emails avec problèmes", len(invalid_emails))
             with col3:
                 if valid_emails:
-                    # Calculate time estimation based on delay mode
-                    if delay_mode == "Délai fixe":
-                        estimated_delay = delay_between_emails
-                    else:  # Délai aléatoire
-                        estimated_delay = (min_delay + max_delay) / 2  # Average
-
-                    sending_time = calculate_sending_time(len(valid_contacts), estimated_delay)
+                    # Hardcoded 1 second delay
+                    sending_time = calculate_sending_time(valid_contacts_count, 1)
                     st.metric("Temps d'envoi", sending_time)
 
-            # Anti-spam recommendations
-            delay_display = f"{delay_between_emails} secondes" if delay_mode == "Délai fixe" else f"{min_delay}-{max_delay} secondes (aléatoire)"
-            estimated_delay = delay_between_emails if delay_mode == "Délai fixe" else (min_delay + max_delay) / 2
-
+            # Configuration display
             st.markdown(f"""
-            **🛡️ Configuration anti-spam active :**
-            - ⏱️ Délai entre emails : {delay_display}
+            **Configuration :**
+            - ⏱️ Délai entre emails : 1 seconde
             - 🧪 Mode test : {'Activé (5 emails max)' if test_mode else 'Désactivé'}
-            - 📧 Emails à envoyer : {len(valid_contacts)}
-            - ⏰ Temps total estimé : {calculate_sending_time(len(valid_contacts), estimated_delay)}
+            - 📧 Emails à envoyer : {valid_contacts_count}
+            - ⏰ Temps total estimé : {calculate_sending_time(valid_contacts_count, 1)}
             """)
 
             # Add test mode information
             if test_mode:
                 st.info(f"📧 Test: Les 5 emails seront envoyés à {sender_email}")
-            st.markdown('</div>', unsafe_allow_html=True)
 
             if invalid_emails:
                 st.subheader("⚠️ Emails nécessitant une révision")
@@ -1247,19 +1101,6 @@ def main():
                                         rel.attach(MIMEText(email_data['personalized_email'], 'html', 'utf-8'))
                                         alt.attach(rel)
 
-                                        # Add compressed images as inline attachments
-                                        logo_file = st.session_state.get('logo_file', None)
-                                        if logo_file:
-                                            try:
-                                                # Compress logo before attaching
-                                                compressed_logo = st.session_state.email_automation.compress_image(logo_file)
-                                                logo_attachment = MIMEImage(compressed_logo.getvalue())
-                                                logo_attachment.add_header('Content-ID', '<logo>')
-                                                logo_attachment.add_header('Content-Disposition', 'inline', filename='logo.jpg')
-                                                rel.attach(logo_attachment)
-                                            except Exception as e:
-                                                st.warning(f"⚠️ Impossible d'ajouter le logo: {e}")
-
                                         # Add decorative image as inline attachment
                                         decorative_image_file = st.session_state.get('decorative_image_file', None)
                                         if decorative_image_file:
@@ -1313,12 +1154,9 @@ def main():
 
                                     progress_bar_invalid.progress((i + 1) / len(validated_emails))
 
-                                    # Anti-spam delay
+                                    # Anti-spam delay - hardcoded 1 second
                                     if i < len(validated_emails) - 1:
-                                        if delay_mode == "Délai fixe":
-                                            time.sleep(delay_between_emails)
-                                        else:  # Délai aléatoire
-                                            time.sleep(random.randint(min_delay, max_delay))
+                                        time.sleep(1)
 
                                 server.quit()
 
@@ -1357,14 +1195,14 @@ def main():
                     st.error("⚠️ Configuration Gmail incomplète. Vérifiez la barre latérale.")
                 else:
                     # Show preview of emails to send
-                    with st.expander(f"Aperçu des {len(valid_contacts)} emails à envoyer"):
+                    with st.expander(f"Aperçu des {len(valid_emails)} emails à envoyer"):
                         for email_data in valid_emails[:5]:  # Show first 5
                             # Get display name and location with fallbacks
                             display_name = email_data.get('contact_name', email_data.get('Name', email_data.get('Full Name', 'Contact')))
                             location = email_data.get('site', email_data.get('Site', email_data.get('Location', 'N/A')))
                             st.write(f"**{display_name}** ({email_data['email']}) - {location} - [Gmail-style]")
-                        if len(valid_contacts) > 5:
-                            st.write(f"... et {len(valid_contacts) - 5} autres")
+                        if len(valid_emails) > 5:
+                            st.write(f"... et {len(valid_emails) - 5} autres")
 
                         # Show CC information
                         if cc_emails and cc_emails.strip():
@@ -1413,19 +1251,6 @@ def main():
                                     rel = MIMEMultipart('related')
                                     rel.attach(MIMEText(email_data['personalized_email'], 'html', 'utf-8'))
                                     alt.attach(rel)
-
-                                    # Add compressed images as inline attachments
-                                    logo_file = st.session_state.get('logo_file', None)
-                                    if logo_file:
-                                        try:
-                                            # Compress logo before attaching
-                                            compressed_logo = st.session_state.email_automation.compress_image(logo_file)
-                                            logo_attachment = MIMEImage(compressed_logo.getvalue())
-                                            logo_attachment.add_header('Content-ID', '<logo>')
-                                            logo_attachment.add_header('Content-Disposition', 'inline', filename='logo.jpg')
-                                            rel.attach(logo_attachment)
-                                        except Exception as e:
-                                            st.warning(f"⚠️ Impossible d'ajouter le logo: {e}")
 
                                     # Add decorative image as inline attachment
                                     decorative_image_file = st.session_state.get('decorative_image_file', None)
@@ -1481,12 +1306,9 @@ def main():
 
                                 progress_bar.progress((i + 1) / len(valid_emails))
 
-                                # Anti-spam delay
+                                # Anti-spam delay - hardcoded 1 second
                                 if i < len(valid_emails) - 1:  # Don't delay after last email
-                                    if delay_mode == "Délai fixe":
-                                        time.sleep(delay_between_emails)
-                                    else:  # Délai aléatoire
-                                        time.sleep(random.randint(min_delay, max_delay))
+                                    time.sleep(1)
 
                             server.quit()
 
