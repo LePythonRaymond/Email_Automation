@@ -491,7 +491,7 @@ def main():
     USERS = [
         {"name": "Salomé Cremona", "email": "salome.cremona@merciraymond.fr", "password": "kosj dkza wuku hlbo"},
         {"name": "Taddeo Carpinelli", "email": "taddeo.carpinelli@merciraymond.fr", "password": "ucfk qkhc jzmd ubry"},
-        {"name": "Guillaume H.", "email": "guillaume.herr@merciraymond.fr", "password": "ahlv pstg ibnv elsm"}# Add more users as needed
+        {"name": "Guillaume H.", "email": "guillaume@merciraymond.fr", "password": "ahlv pstg ibnv elsm"}# Add more users as needed
     ]
 
     # Create user selection dropdown
