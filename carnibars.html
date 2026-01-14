@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Babidolle vs Carnibars</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #202020;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            font-family: 'Courier New', Courier, monospace;
+            overflow: hidden;
+        }
+        canvas {
+            border: 4px solid #fff;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+        }
+        #ui {
+            position: absolute;
+            top: 10px;
+            color: white;
+            font-size: 20px;
+            text-shadow: 2px 2px #000;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div id="ui">
+        <div>BABIDOLLE ADVENTURE</div>
+        <div id="level-name">World 1: Magical Horses</div>
+        <div style="font-size: 14px">Arrows to Move/Jump | R to Restart</div>
+    </div>
+    <canvas id="gameCanvas" width="800" height="500"></canvas>
+
+<script>
+/**
+ * ENGINE SETUP
+ */
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const uiLevel = document.getElementById('level-name');
+
+// Game Constants
+const GRAVITY = 0.6;
+const FRICTION = 0.8;
+const JUMP_FORCE = -12;
+const SPEED = 5;
+
+// Game State
+let gameRunning = true;
+let currentLevel = 1;
+let frame = 0;
+
+// Input handling
+const keys = {
+    right: false,
+    left: false,
+    up: false
+};
+
+window.addEventListener('keydown', (e) => {
+    if(e.key === 'ArrowRight') keys.right = true;
+    if(e.key === 'ArrowLeft') keys.left = true;
+    if(e.key === 'ArrowUp') {
+        if (!keys.up && player.grounded) {
+            player.velY = JUMP_FORCE;
+            player.grounded = false;
+        }
+        keys.up = true;
+    }
+    if(e.key === 'r' || e.key === 'R') resetGame(1);
+});
+
+window.addEventListener('keyup', (e) => {
+    if(e.key === 'ArrowRight') keys.right = false;
+    if(e.key === 'ArrowLeft') keys.left = false;
+    if(e.key === 'ArrowUp') keys.up = false;
+});
+
+/**
+ * CLASSES
+ */
+
+class Player {
+    constructor(x, y) {
+        this.x = x;
+        this.y = y;
+        this.w = 30;
+        this.h = 40;
+        this.velX = 0;
+        this.velY = 0;
+        this.grounded = false;
+        this.color = "orange"; // Ginger hair
+    }
+
+    update() {
+        // Movement
+        if (keys.right) {
+            if (this.velX < SPEED) this.velX++;
+        }
+        if (keys.left) {
+            if (this.velX > -SPEED) this.velX--;
+        }
+
+        this.velX *= FRICTION;
+        this.velY += GRAVITY;
+
+        this.x += this.velX;
+        this.y += this.velY;
+
+        // Ground Collision (Simple floor)
+        if (this.y + this.h > canvas.height) {
+            this.y = canvas.height - this.h;
+            this.velY = 0;
+            this.grounded = true;
+            // Pit death logic is handled in game loop
+        }
+    }
+
+    draw() {
+        // Draw Babidolle
+        // Body (Lutin green)
+        ctx.fillStyle = "#228B22"; 
+        ctx.fillRect(this.x + 5, this.y + 20, 20, 20);
+        
+        // Head (Square Ginger Hair)
+        ctx.fillStyle = "#D35400"; // Ginger/Orange
+        ctx.fillRect(this.x, this.y, 30, 25); // Big square hair
+        
+        // Face
+        ctx.fillStyle = "#FFD1DC"; 
+        ctx.fillRect(this.x + 5, this.y + 5, 20, 15);
+        
+        // Eyes
+        ctx.fillStyle = "black";
+        ctx.fillRect(this.x + 8, this.y + 8, 4, 4);
+        ctx.fillRect(this.x + 18, this.y + 8, 4, 4);
+    }
+}
+
+class Platform {
+    constructor(x, y, w, h) {
+        this.x = x; this.y = y; this.w = w; this.h = h;
+    }
+    draw() {
+        if(currentLevel === 1) ctx.fillStyle = "#654321"; // Dirt
+        else if(currentLevel === 2) ctx.fillStyle = "#505050"; // Stone
+        else ctx.fillStyle = "#330000"; // Dungeon brick
+        ctx.fillRect(this.x, this.y, this.w, this.h);
+        
+        // Grass/Top detail
+        if(currentLevel === 1) {
+            ctx.fillStyle = "#32CD32"; 
+            ctx.fillRect(this.x, this.y, this.w, 5);
+        }
+    }
+}
+
+class Enemy {
+    constructor(x, y, type) {
+        this.x = x; this.y = y; 
+        this.w = 30; this.h = 30;
+        this.velX = -2;
+        this.type = type; // 'horse', 'bed', 'pant'
+        this.patrolStart = x - 100;
+        this.patrolEnd = x + 100;
+    }
+
+    update() {
+        this.x += this.velX;
+        if (this.x < this.patrolStart || this.x > this.patrolEnd) this.velX *= -1;
+    }
+
+    draw() {
+        if (this.type === 'horse') {
+            // Magical Horse
+            ctx.fillStyle = "#FF69B4"; // Magical Pink
+            ctx.fillRect(this.x, this.y + 10, 30, 20); // Body
+            ctx.fillRect(this.x + (this.velX < 0 ? 0 : 20), this.y, 10, 15); // Head
+            ctx.fillStyle = "white"; // Horn
+            ctx.fillRect(this.x + (this.velX < 0 ? 0 : 22), this.y - 8, 4, 10); 
+        } else if (this.type === 'bed') {
+            // Cave Bed
+            ctx.fillStyle = "#8B4513"; // Wood
+            ctx.fillRect(this.x, this.y + 15, 30, 15);
+            ctx.fillStyle = "white"; // Sheets
+            ctx.fillRect(this.x + 2, this.y + 10, 26, 10);
+            ctx.fillStyle = "red"; // Pillow
+            ctx.fillRect(this.x + 2, this.y + 8, 8, 8);
+        } else if (this.type === 'pant') {
+            // Dirty Pants
+            ctx.fillStyle = "#555"; // Dirty Grey
+            ctx.fillRect(this.x, this.y, 12, 30); // Leg 1
+            ctx.fillRect(this.x + 18, this.y, 12, 30); // Leg 2
+            ctx.fillRect(this.x, this.y, 30, 10); // Waist
+            // Patches
+            ctx.fillStyle = "#3e2723"; 
+            ctx.fillRect(this.x+2, this.y+15, 8, 8);
+        }
+    }
+}
+
+class Boss {
+    constructor(x, y) {
+        this.x = x; this.y = y;
+        this.w = 60; this.h = 80;
+        this.velX = 3;
+        this.hp = 3;
+        this.isDead = false;
+        this.flashTime = 0;
+    }
+    
+    update() {
+        if(this.isDead) return;
+        this.x += this.velX;
+        if(this.x < 400 || this.x > 700) this.velX *= -1;
+        if(this.flashTime > 0) this.flashTime--;
+    }
+
+    draw() {
+        if(this.isDead) return;
+        if(this.flashTime > 0 && Math.floor(Date.now() / 100) % 2 === 0) return; // Flicker
+
+        ctx.fillStyle = "#4a148c"; // Evil Purple Suit
+        ctx.fillRect(this.x, this.y, this.w, this.h);
+        
+        // Head
+        ctx.fillStyle = "#ffccbc";
+        ctx.fillRect(this.x + 10, this.y - 20, 40, 30);
+        
+        // The HUGE NOSE
+        ctx.fillStyle = "#d84315";
+        if(this.velX < 0) {
+            ctx.fillRect(this.x - 10, this.y - 10, 20, 10); // Facing left
+        } else {
+            ctx.fillRect(this.x + 50, this.y - 10, 20, 10); // Facing right
+        }
+
+        // Name
+        ctx.fillStyle = "white";
+        ctx.font = "10px Arial";
+        ctx.fillText("CARNIBARS", this.x, this.y - 30);
+    }
+}
+
+/**
+ * GAME OBJECTS
+ */
+let player = new Player(50, 300);
+let platforms = [];
+let enemies = [];
+let boss = null;
+let endFlagX = 0;
+
+/**
+ * LEVEL GENERATION
+ */
+function loadLevel(lvl) {
+    currentLevel = lvl;
+    player.x = 50;
+    player.y = 300;
+    player.velX = 0;
+    player.velY = 0;
+    platforms = [];
+    enemies = [];
+    boss = null;
+
+    // Floor (Safety net)
+    platforms.push(new Platform(0, canvas.height - 20, canvas.width * 2, 20));
+
+    if (lvl === 1) {
+        uiLevel.innerText = "World 1: Magical Horses (Friendly)";
+        document.body.style.backgroundColor = "#87CEEB"; // Sky blue
+        
+        // Design
+        platforms.push(new Platform(0, 400, 800, 100)); // Ground
+        platforms.push(new Platform(200, 300, 100, 20));
+        platforms.push(new Platform(350, 200, 100, 20));
+        platforms.push(new Platform(500, 300, 100, 20));
+        
+        // Enemies
+        enemies.push(new Enemy(400, 370, 'horse'));
+        enemies.push(new Enemy(600, 370, 'horse'));
+        
+        endFlagX = 750;
+
+    } else if (lvl === 2) {
+        uiLevel.innerText = "World 2: Cave of Beds (Sleepy)";
+        document.body.style.backgroundColor = "#2F4F4F"; // Dark Slate
+        
+        // Design (Gaps)
+        platforms = []; // Clear safety net for pits
+        platforms.push(new Platform(0, 400, 200, 100));
+        platforms.push(new Platform(250, 350, 150, 20)); // Floating bed platform
+        platforms.push(new Platform(450, 300, 150, 20));
+        platforms.push(new Platform(650, 400, 150, 100));
+
+        // Ceiling decoration logic (just visual mostly, but using platform class)
+        platforms.push(new Platform(100, 100, 100, 50)); 
+        
+        enemies.push(new Enemy(300, 320, 'bed'));
+        enemies.push(new Enemy(500, 270, 'bed'));
+        
+        endFlagX = 750;
+
+    } else if (lvl === 3) {
+        uiLevel.innerText = "World 3: The Dungeon (Messy)";
+        document.body.style.backgroundColor = "#300000"; // Dark Red
+        
+        // Arena Design
+        platforms = [];
+        platforms.push(new Platform(0, 400, 800, 100));
+        platforms.push(new Platform(100, 250, 100, 20));
+        platforms.push(new Platform(600, 250, 100, 20));
+
+        enemies.push(new Enemy(200, 370, 'pant'));
+        
+        // BOSS
+        boss = new Boss(600, 320);
+        endFlagX = 9999; // No walking to end, must kill boss
+    }
+}
+
+/**
+ * UTILS
+ */
+function checkCollision(rect1, rect2) {
+    return (rect1.x < rect2.x + rect2.w &&
+            rect1.x + rect1.w > rect2.x &&
+            rect1.y < rect2.y + rect2.h &&
+            rect1.y + rect1.h > rect2.y);
+}
+
+function resetGame(lvl) {
+    gameRunning = true;
+    loadLevel(lvl);
+}
+
+/**
+ * MAIN LOOP
+ */
+function loop() {
+    if (!gameRunning) {
+        ctx.fillStyle = "rgba(0,0,0,0.7)";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = "white";
+        ctx.font = "40px Courier";
+        ctx.textAlign = "center";
+        ctx.fillText("GAME OVER / VICTORY", canvas.width/2, canvas.height/2);
+        ctx.font = "20px Courier";
+        ctx.fillText("Press R to Restart", canvas.width/2, canvas.height/2 + 40);
+        requestAnimationFrame(loop);
+        return;
+    }
+
+    // Clear screen
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Draw Background elements based on level
+    if(currentLevel === 3) {
+        // Draw leather jackets on wall
+        ctx.fillStyle = "#111";
+        ctx.fillRect(100, 100, 50, 60);
+        ctx.fillRect(300, 150, 50, 60);
+        ctx.fillStyle = "grey"; // Zipper
+        ctx.fillRect(124, 100, 2, 60);
+    }
+
+    player.update();
+    player.grounded = false;
+
+    // Platform Collision
+    for (let p of platforms) {
+        p.draw();
+        // Simple AABB + direction check
+        if (checkCollision(player, p)) {
+            // Determine side (Mainly checking collision from top)
+            let bottomDist = (player.y + player.h) - p.y;
+            let topDist = (p.y + p.h) - player.y;
+            
+            if (bottomDist < 20 && player.velY >= 0) {
+                player.grounded = true;
+                player.velY = 0;
+                player.y = p.y - player.h;
+            } else if (topDist < 20 && player.velY < 0) {
+                player.velY = 0;
+                player.y = p.y + p.h;
+            }
+        }
+    }
+
+    // Bounds checks
+    if (player.x < 0) player.x = 0;
+    // Next Level Logic
+    if (player.x > endFlagX && !boss) {
+        if(currentLevel < 3) loadLevel(currentLevel + 1);
+    }
+    // Pit Death
+    if (player.y > canvas.height) resetGame(currentLevel);
+
+    // Enemy Logic
+    for (let e of enemies) {
+        e.update();
+        e.draw();
+        
+        if (checkCollision(player, e)) {
+            // Mario logic: jump on top = kill, touch side = die
+            if (player.velY > 0 && player.y + player.h < e.y + e.h/2 + 10) {
+                player.velY = -8; // Bounce
+                // Remove enemy
+                let index = enemies.indexOf(e);
+                if (index > -1) enemies.splice(index, 1);
+            } else {
+                resetGame(currentLevel);
+            }
+        }
+    }
+
+    // Boss Logic (Level 3)
+    if (boss) {
+        boss.update();
+        boss.draw();
+
+        // Boss UI
+        ctx.fillStyle = "white";
+        ctx.fillText("Carnibars HP: " + boss.hp, 400, 50);
+
+        if (!boss.isDead && checkCollision(player, boss)) {
+             if (player.velY > 0 && player.y + player.h < boss.y + boss.h/2 + 15) {
+                // Damage Boss
+                if(boss.flashTime <= 0) {
+                    boss.hp--;
+                    boss.flashTime = 60; // invincibility frames
+                    player.velY = -10;
+                    
+                    if(boss.hp <= 0) {
+                        boss.isDead = true;
+                        uiLevel.innerText = "YOU DEFEATED CARNIBARS! WIN!";
+                        gameRunning = false;
+                    }
+                }
+            } else if (boss.flashTime <= 0) {
+                resetGame(currentLevel);
+            }
+        }
+    }
+
+    // Draw Player
+    player.draw();
+
+    // Draw Flag (Level end)
+    if(currentLevel < 3) {
+        ctx.fillStyle = "gold";
+        ctx.fillRect(endFlagX, 200, 10, 200);
+        ctx.fillStyle = "red";
+        ctx.beginPath();
+        ctx.moveTo(endFlagX+10, 200);
+        ctx.lineTo(endFlagX+50, 220);
+        ctx.lineTo(endFlagX+10, 240);
+        ctx.fill();
+    }
+
+    requestAnimationFrame(loop);
+}
+
+// Start
+loadLevel(1);
+loop();
+
+</script>
+</body>
+</html>
