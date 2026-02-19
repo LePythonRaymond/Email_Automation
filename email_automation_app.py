@@ -388,11 +388,13 @@ class EmailAutomation:
             # Build image style with chosen size (max-width)
             img_style = f"max-width: {decorative_image_size}; width: 100%; height: auto; border:0; outline:0; display: block;"
 
+            # Wrapper so the image size box is always visible (same max-width + subtle border)
+            image_wrapper_style = f"margin: 16px 0; max-width: {decorative_image_size}; width: 100%; box-sizing: border-box; border: 1px solid #e0e0e0; border-radius: 4px; overflow: hidden;"
             # Prepare decorative image section - only if no {Image} placeholder
             decorative_image_section = ""
             if decorative_image_file and not has_image_placeholder:
                 decorative_image_section = f'''
-                <div style="margin: 16px 0;">
+                <div style="{image_wrapper_style}">
                 <img src="cid:decorative_image" alt="Image" style="{img_style}">
                 </div>'''
             elif show_image_placeholder and not decorative_image_file and not has_image_placeholder:
@@ -434,11 +436,11 @@ class EmailAutomation:
             first_paragraph = self.convert_markdown_to_html(first_paragraph)
             second_paragraph = self.convert_markdown_to_html(second_paragraph)
 
-            # Replace {Image} placeholder with actual image HTML or size box
+            # Replace {Image} placeholder with actual image HTML or size box (same wrapper for visible box)
             if has_image_placeholder:
                 if decorative_image_file:
                     image_html = f'''
-                <div style="margin: 16px 0;">
+                <div style="{image_wrapper_style}">
                 <img src="cid:decorative_image" alt="Image" style="{img_style}">
                 </div>'''
                 else:
@@ -521,7 +523,8 @@ def main():
     USERS = [
         {"name": "Salomé Cremona", "email": "salome.cremona@merciraymond.fr", "password": "kosj dkza wuku hlbo"},
         {"name": "Taddeo Carpinelli", "email": "taddeo.carpinelli@merciraymond.fr", "password": "tdcg uymo tswu urvk"},
-        {"name": "Guillaume H.", "email": "guillaume@merciraymond.fr", "password": "ahlv pstg ibnv elsm"}# Add more users as needed
+        {"name": "Guillaume H.", "email": "guillaume@merciraymond.fr", "password": "ahlv pstg ibnv elsm"}
+        {"name": "Hugo Meunier", "email": "hugo@merciraymond.fr", "password": "rayq gdyj vaec jmrb"}# Add more users as needed
     ]
 
     # Create user selection dropdown
@@ -842,6 +845,17 @@ def main():
                 decorative_image_size=decorative_image_size_css,
                 show_image_placeholder=True
             )
+        # In preview iframe cid: doesn't work; inject image as base64 so it displays at correct size
+        _preview_img = st.session_state.get('decorative_image_file')
+        if _preview_img is not None:
+            try:
+                _preview_img.seek(0)
+                _b64 = base64.b64encode(_preview_img.read()).decode('utf-8')
+                _mime = _preview_img.type if getattr(_preview_img, 'type', None) else 'image/jpeg'
+                _data_url = f"data:{_mime};base64,{_b64}"
+                sample_html = sample_html.replace('src="cid:decorative_image"', f'src="{_data_url}"')
+            except Exception:
+                pass
         st.markdown(f'<p style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; line-height: 1.4; color: #202124; margin: 0 0 16px 0;"><strong>Objet:</strong> {sample_subject}</p>', unsafe_allow_html=True)
         st.components.v1.html(sample_html, height=300, scrolling=True)
 
