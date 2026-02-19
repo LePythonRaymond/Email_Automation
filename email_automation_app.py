@@ -8,6 +8,8 @@ from email.mime.image import MIMEImage
 from email.mime.application import MIMEApplication
 import os
 from typing import Dict, List, Tuple, Optional
+import json
+from pathlib import Path
 
 import time
 import base64
@@ -97,6 +99,13 @@ class EmailAutomation:
 
   {logo_section}
 </div>"""
+        # Decorative image size options: label -> CSS max-width value
+        self.decorative_image_sizes = {
+            "Petit (280px)": "280px",
+            "Moyen (480px)": "480px",
+            "Grand (640px)": "640px",
+            "Pleine largeur (100%)": "100%",
+        }
         # Get OpenAI API key from secrets
  #       try:
 #            self.openai_api_key = st.secrets["api_key"]
@@ -325,10 +334,13 @@ class EmailAutomation:
         return text
 
     def personalize_email(self, contact_data: Dict[str, str], email_content: str, use_html: bool = False,
-                         logo_file=None, decorative_image_file=None, attachment_files=None, email_subject: str = "") -> Tuple[str, str]:
+                         logo_file=None, decorative_image_file=None, attachment_files=None, email_subject: str = "",
+                         decorative_image_size: str = "100%", show_image_placeholder: bool = False) -> Tuple[str, str]:
         """
         Dynamic personalization with any column placeholders from Excel data
         Returns: (personalized_content, personalized_subject)
+        decorative_image_size: CSS max-width for the main image (e.g. "280px", "100%").
+        show_image_placeholder: if True and no image, show a size box in preview.
         """
         # Safety check for email content - use appropriate template based on format
         if email_content is None:
@@ -373,12 +385,21 @@ class EmailAutomation:
             # Check if {Image} placeholder exists in content
             has_image_placeholder = '{Image}' in personalized
 
+            # Build image style with chosen size (max-width)
+            img_style = f"max-width: {decorative_image_size}; width: 100%; height: auto; border:0; outline:0; display: block;"
+
             # Prepare decorative image section - only if no {Image} placeholder
             decorative_image_section = ""
             if decorative_image_file and not has_image_placeholder:
                 decorative_image_section = f'''
                 <div style="margin: 16px 0;">
-                <img src="cid:decorative_image" alt="Image" style="max-width: 100%; height: auto; border:0; outline:0; display: block;">
+                <img src="cid:decorative_image" alt="Image" style="{img_style}">
+                </div>'''
+            elif show_image_placeholder and not decorative_image_file and not has_image_placeholder:
+                # Preview: show a box of the chosen size when no image is uploaded
+                decorative_image_section = f'''
+                <div style="margin: 16px 0; max-width: {decorative_image_size}; width: 100%; min-height: 180px; background: #f5f5f5; border: 2px dashed #bdbdbd; border-radius: 4px; display: flex; align-items: center; justify-content: center; color: #757575; font-size: 13px; box-sizing: border-box;">
+                Image ({decorative_image_size})
                 </div>'''
 
             # Split content into first and second paragraphs for Gmail-style layout
@@ -413,14 +434,21 @@ class EmailAutomation:
             first_paragraph = self.convert_markdown_to_html(first_paragraph)
             second_paragraph = self.convert_markdown_to_html(second_paragraph)
 
-            # Replace {Image} placeholder with actual image HTML if it exists
-            if has_image_placeholder and decorative_image_file:
-                image_html = f'''
+            # Replace {Image} placeholder with actual image HTML or size box
+            if has_image_placeholder:
+                if decorative_image_file:
+                    image_html = f'''
                 <div style="margin: 16px 0;">
-                <img src="cid:decorative_image" alt="Image" style="max-width: 100%; height: auto; border:0; outline:0; display: block;">
+                <img src="cid:decorative_image" alt="Image" style="{img_style}">
                 </div>'''
-                first_paragraph = first_paragraph.replace('{Image}', image_html)
-                second_paragraph = second_paragraph.replace('{Image}', image_html)
+                else:
+                    image_html = f'''
+                <div style="margin: 16px 0; max-width: {decorative_image_size}; width: 100%; min-height: 180px; background: #f5f5f5; border: 2px dashed #bdbdbd; border-radius: 4px; display: flex; align-items: center; justify-content: center; color: #757575; font-size: 13px; box-sizing: border-box;">
+                Image ({decorative_image_size})
+                </div>''' if show_image_placeholder else ''
+                if image_html:
+                    first_paragraph = first_paragraph.replace('{Image}', image_html)
+                    second_paragraph = second_paragraph.replace('{Image}', image_html)
 
             # Apply Gmail-style HTML template with unified content
             personalized = self.html_template.format(
@@ -433,9 +461,11 @@ class EmailAutomation:
         return personalized, personalized_subject
 
     def personalize_email_with_ai(self, contact_data: Dict[str, str], email_content: str, use_html: bool = False,
-                                 logo_file=None, decorative_image_file=None, attachment_files=None, email_subject: str = "") -> Tuple[str, str]:
+                                 logo_file=None, decorative_image_file=None, attachment_files=None, email_subject: str = "",
+                                 decorative_image_size: str = "100%", show_image_placeholder: bool = False) -> Tuple[str, str]:
         """AI personalization removed - using simple personalization instead"""
-        return self.personalize_email(contact_data, email_content, use_html, logo_file, decorative_image_file, attachment_files, email_subject)
+        return self.personalize_email(contact_data, email_content, use_html, logo_file, decorative_image_file, attachment_files, email_subject,
+                                      decorative_image_size=decorative_image_size, show_image_placeholder=show_image_placeholder)
 
     def verify_email_content(self, email_content: str) -> Tuple[bool, List[str]]:
         """SUPER SIMPLE verification - only check for curly brace placeholders"""
@@ -747,6 +777,21 @@ def main():
             help="Image qui apparaîtra dans le corps de l'email HTML"
         )
 
+        # Size of the main decorative image
+        size_options = list(st.session_state.email_automation.decorative_image_sizes.keys())
+        default_size_index = size_options.index("Pleine largeur (100%)") if "Pleine largeur (100%)" in size_options else 0
+        if 'decorative_image_size' not in st.session_state:
+            st.session_state.decorative_image_size = size_options[default_size_index]
+        decorative_image_size_label = st.selectbox(
+            "Taille de l'image décorative",
+            options=size_options,
+            index=size_options.index(st.session_state.decorative_image_size) if st.session_state.decorative_image_size in size_options else default_size_index,
+            help="Choisissez la largeur maximale de l'image dans l'email. L'aperçu affiche un cadre de cette taille si aucune image n'est chargée.",
+            key="decorative_image_size_select"
+        )
+        st.session_state.decorative_image_size = decorative_image_size_label
+        decorative_image_size_css = st.session_state.email_automation.decorative_image_sizes.get(decorative_image_size_label, "100%")
+
         attachment_files = st.file_uploader(
             "Fichiers à joindre",
             type=['pdf', 'doc', 'docx', 'xls', 'xlsx', 'png', 'jpg', 'jpeg', 'txt'],
@@ -791,9 +836,11 @@ def main():
         sample_html, sample_subject = st.session_state.email_automation.personalize_email(
                 sample_contact, email_content if email_content else "", use_html=True,
                 logo_file=None,
-            decorative_image_file=st.session_state.decorative_image_file,
-            attachment_files=st.session_state.get('attachment_files', []),
-            email_subject=email_subject if email_subject else ""
+                decorative_image_file=st.session_state.decorative_image_file,
+                attachment_files=st.session_state.get('attachment_files', []),
+                email_subject=email_subject if email_subject else "",
+                decorative_image_size=decorative_image_size_css,
+                show_image_placeholder=True
             )
         st.markdown(f'<p style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; line-height: 1.4; color: #202124; margin: 0 0 16px 0;"><strong>Objet:</strong> {sample_subject}</p>', unsafe_allow_html=True)
         st.components.v1.html(sample_html, height=300, scrolling=True)
@@ -831,11 +878,16 @@ def main():
                         status_text.text(f"Traitement: {display_name} ({i+1}/{len(valid_contacts)})")
 
                         # Always use simple personalization - reliable and bulletproof
+                        _img_size_css = st.session_state.email_automation.decorative_image_sizes.get(
+                            st.session_state.get('decorative_image_size', 'Pleine largeur (100%)'), "100%"
+                        )
                         personalized, personalized_subject = st.session_state.email_automation.personalize_email(
                             contact_data, email_content_for_processing, use_html_for_processing,
                             logo_file=None, decorative_image_file=decorative_image_file_for_processing,
                             attachment_files=st.session_state.get('attachment_files', []),
-                            email_subject=email_subject_for_processing
+                            email_subject=email_subject_for_processing,
+                            decorative_image_size=_img_size_css,
+                            show_image_placeholder=False
                         )
 
                         is_valid, issues = st.session_state.email_automation.verify_email_content(personalized)
@@ -885,6 +937,20 @@ def main():
 
         st.divider()
 
+        # Progress file to track sent emails
+        progress_file = Path("email_sending_progress.json")
+
+        # Load previously sent emails if file exists
+        sent_emails_set = set()
+        if progress_file.exists():
+            try:
+                with open(progress_file, 'r', encoding='utf-8') as f:
+                    progress_data = json.load(f)
+                    if 'sent_emails' in progress_data:
+                        sent_emails_set = set(progress_data['sent_emails'])
+            except Exception as e:
+                st.warning(f"⚠️ Impossible de charger le progrès précédent: {e}")
+
         # Get sender credentials from session state
         sender_email = st.session_state.get('sender_email', None)
         sender_password = st.session_state.get('sender_password', None)
@@ -918,8 +984,20 @@ def main():
                         email_data['email'] = email_data['original_email']  # Restore original email
                         del email_data['original_email']  # Clean up
 
-            # Get valid_contacts count
-            valid_contacts_count = len(st.session_state.valid_contacts) if hasattr(st.session_state, 'valid_contacts') else len(valid_emails)
+            # Filter out already sent emails
+            remaining_emails = [email for email in valid_emails if email['email'] not in sent_emails_set]
+            already_sent_count = len(valid_emails) - len(remaining_emails)
+
+            # Show status if some emails were already sent
+            if already_sent_count > 0 and len(remaining_emails) > 0:
+                st.info(f"📊 **Progrès:** {already_sent_count} emails déjà envoyés. {len(remaining_emails)} emails restants à envoyer.")
+                if st.button("🗑️ Effacer le progrès et recommencer", type="secondary"):
+                    if progress_file.exists():
+                        progress_file.unlink()
+                    st.rerun()
+
+            # Get valid_contacts count (use remaining for display)
+            valid_contacts_count = len(remaining_emails)
 
             col1, col2, col3 = st.columns(3)
             with col1:
@@ -927,7 +1005,7 @@ def main():
             with col2:
                 st.metric("Emails avec problèmes", len(invalid_emails))
             with col3:
-                if valid_emails:
+                if remaining_emails:
                     # Hardcoded 1 second delay
                     sending_time = calculate_sending_time(valid_contacts_count, 1)
                     st.metric("Temps d'envoi", sending_time)
@@ -1073,6 +1151,17 @@ def main():
                                 server.starttls()
                                 server.login(sender_email, sender_password)
 
+                                # Load current progress
+                                current_sent_emails = set()
+                                if progress_file.exists():
+                                    try:
+                                        with open(progress_file, 'r', encoding='utf-8') as f:
+                                            progress_data = json.load(f)
+                                            if 'sent_emails' in progress_data:
+                                                current_sent_emails = set(progress_data['sent_emails'])
+                                    except:
+                                        pass
+
                                 for i, email_data in enumerate(validated_emails):
                                     try:
                                         # Get display name with fallbacks
@@ -1147,6 +1236,17 @@ def main():
                                         server.sendmail(sender_email, recipients, text)
                                         sent_count += 1
 
+                                        # Track sent email
+                                        current_sent_emails.add(email_data['email'])
+
+                                        # Save progress after each email
+                                        progress_data = {
+                                            'sent_emails': list(current_sent_emails),
+                                            'last_update': datetime.now().isoformat()
+                                        }
+                                        with open(progress_file, 'w', encoding='utf-8') as f:
+                                            json.dump(progress_data, f, indent=2)
+
                                     except Exception as e:
                                         # Get display name with fallbacks
                                         display_name = email_data.get('contact_name', email_data.get('Name', email_data.get('Full Name', 'Contact')))
@@ -1188,7 +1288,7 @@ def main():
                                 st.error(f"Erreur de connexion Gmail: {e}")
                                 st.info("💡 Vérifiez que vous utilisez un mot de passe d'application Gmail")
 
-            if valid_emails:
+            if remaining_emails:
                 st.subheader("✅ Emails prêts à envoyer")
 
                 # Gmail configuration check
@@ -1196,14 +1296,14 @@ def main():
                     st.error("⚠️ Configuration Gmail incomplète. Vérifiez la barre latérale.")
                 else:
                     # Show preview of emails to send
-                    with st.expander(f"Aperçu des {len(valid_emails)} emails à envoyer"):
-                        for email_data in valid_emails[:5]:  # Show first 5
+                    with st.expander(f"Aperçu des {len(remaining_emails)} emails à envoyer"):
+                        for email_data in remaining_emails[:5]:  # Show first 5
                             # Get display name and location with fallbacks
                             display_name = email_data.get('contact_name', email_data.get('Name', email_data.get('Full Name', 'Contact')))
                             location = email_data.get('site', email_data.get('Site', email_data.get('Location', 'N/A')))
                             st.write(f"**{display_name}** ({email_data['email']}) - {location} - [Gmail-style]")
-                        if len(valid_emails) > 5:
-                            st.write(f"... et {len(valid_emails) - 5} autres")
+                        if len(remaining_emails) > 5:
+                            st.write(f"... et {len(remaining_emails) - 5} autres")
 
                         # Show CC information
                         if cc_emails and cc_emails.strip():
@@ -1224,11 +1324,22 @@ def main():
                             server.starttls()
                             server.login(sender_email, sender_password)
 
-                            for i, email_data in enumerate(valid_emails):
+                            # Load current progress
+                            current_sent_emails = set()
+                            if progress_file.exists():
+                                try:
+                                    with open(progress_file, 'r', encoding='utf-8') as f:
+                                        progress_data = json.load(f)
+                                        if 'sent_emails' in progress_data:
+                                            current_sent_emails = set(progress_data['sent_emails'])
+                                except:
+                                    pass
+
+                            for i, email_data in enumerate(remaining_emails):
                                 try:
                                     # Get display name with fallbacks
                                     display_name = email_data.get('contact_name', email_data.get('Name', email_data.get('Full Name', 'Contact')))
-                                    status_text.text(f"Envoi: {display_name} ({i+1}/{len(valid_emails)})")
+                                    status_text.text(f"Envoi: {display_name} ({i+1}/{len(remaining_emails)})")
 
                                     # Create email with proper MIME structure
                                     msg_root = MIMEMultipart('mixed')
@@ -1299,19 +1410,36 @@ def main():
                                     server.sendmail(sender_email, recipients, text)
                                     sent_count += 1
 
+                                    # Track sent email
+                                    current_sent_emails.add(email_data['email'])
+
+                                    # Save progress after each email
+                                    progress_data = {
+                                        'sent_emails': list(current_sent_emails),
+                                        'last_update': datetime.now().isoformat()
+                                    }
+                                    with open(progress_file, 'w', encoding='utf-8') as f:
+                                        json.dump(progress_data, f, indent=2)
+
                                 except Exception as e:
                                     # Get display name with fallbacks
                                     display_name = email_data.get('contact_name', email_data.get('Name', email_data.get('Full Name', 'Contact')))
                                     st.error(f"Erreur envoi {display_name}: {e}")
                                     failed_count += 1
 
-                                progress_bar.progress((i + 1) / len(valid_emails))
+                                progress_bar.progress((i + 1) / len(remaining_emails))
 
                                 # Anti-spam delay - hardcoded 1 second
-                                if i < len(valid_emails) - 1:  # Don't delay after last email
+                                if i < len(remaining_emails) - 1:  # Don't delay after last email
                                     time.sleep(1)
 
                             server.quit()
+
+                            # Clear progress file if all emails sent
+                            if len(current_sent_emails) >= len(valid_emails):
+                                if progress_file.exists():
+                                    progress_file.unlink()
+                                st.success("🎉 Tous les emails ont été envoyés! Le fichier de progrès a été effacé.")
 
                             # Final status with prominent green tick
                             if sent_count > 0:
@@ -1336,10 +1464,21 @@ def main():
 
                             status_text.text("✅ Envoi terminé!")
 
+                            # Show remaining count if any
+                            remaining_after = len(valid_emails) - len(current_sent_emails)
+                            if remaining_after > 0:
+                                st.info(f"📊 {remaining_after} emails restants. Rechargez la page pour continuer.")
+
                         except Exception as e:
                             st.error(f"Erreur de connexion Gmail: {e}")
                             st.info("💡 Vérifiez que vous utilisez un mot de passe d'application Gmail")
 
+            elif already_sent_count > 0:
+                st.success(f"✅ Tous les emails ont déjà été envoyés! ({already_sent_count} emails)")
+                if st.button("🗑️ Effacer le progrès", type="secondary"):
+                    if progress_file.exists():
+                        progress_file.unlink()
+                    st.rerun()
             else:
                 st.info("Aucun email valide prêt à envoyer.")
         else:
