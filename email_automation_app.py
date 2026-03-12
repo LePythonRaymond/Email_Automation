@@ -15,6 +15,7 @@ import time
 import base64
 import random
 import html2text
+from io import BytesIO
 from datetime import datetime, timedelta
 
 # Page configuration
@@ -76,6 +77,27 @@ st.markdown("""
 # Gmail SMTP Configuration (hardcoded)
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
+
+
+def to_name_case(s: str) -> str:
+    """Format a name in proper case: first letter of each part capitalized, rest lower (e.g. JEAN-PIERRE -> Jean-Pierre, françois moreau -> François Moreau)."""
+    if not s or not s.strip():
+        return s.strip() if s else s
+    parts = s.strip().split()
+    result = []
+    for word in parts:
+        subparts = word.split("-")
+        capped = []
+        for p in subparts:
+            if not p:
+                continue
+            if len(p) == 1:
+                capped.append(p.upper())
+            else:
+                capped.append(p[0].upper() + p[1:].lower())
+        result.append("-".join(capped))
+    return " ".join(result)
+
 
 class EmailAutomation:
     def __init__(self):
@@ -196,11 +218,13 @@ class EmailAutomation:
                 else:
                     info[col_name] = ''
 
-        # Extract first name and last name from full name columns
+        # Extract first name and last name from full name columns (normalized to proper name case)
         if full_name_columns:
             for full_name_col in full_name_columns:
                 if full_name_col in row.index and pd.notna(row[full_name_col]):
-                    full_name = str(row[full_name_col]).strip()
+                    raw = str(row[full_name_col]).strip()
+                    full_name = to_name_case(raw)
+                    info[full_name_col] = full_name
                     name_parts = full_name.split()
 
                     # Add first name (first part)
@@ -209,9 +233,9 @@ class EmailAutomation:
 
                     # Add last name (all parts after first, joined)
                     if len(name_parts) > 1:
-                        info[f"{full_name_col}_last"] = ' '.join(name_parts[1:])
+                        info[f"{full_name_col}_last"] = " ".join(name_parts[1:])
                     else:
-                        info[f"{full_name_col}_last"] = ''
+                        info[f"{full_name_col}_last"] = ""
 
         return info
 
@@ -501,6 +525,69 @@ def calculate_sending_time(num_emails: int, delay_seconds: int) -> str:
     else:
         return f"{minutes}min"
 
+
+def _users_file_path() -> Path:
+    """Path to users.json in project root (same directory as this script)."""
+    return Path(__file__).resolve().parent / "users.json"
+
+
+def _load_users() -> List[Dict[str, str]]:
+    """Load user list: base users plus any from users.json (no duplicates by email)."""
+    base = [
+        {"name": "Salomé Cremona", "email": "salome.cremona@merciraymond.fr", "password": "kosj dkza wuku hlbo"},
+        {"name": "Taddeo Carpinelli", "email": "taddeo.carpinelli@merciraymond.fr", "password": "tdcg uymo tswu urvk"},
+        {"name": "Guillaume H.", "email": "guillaume@merciraymond.fr", "password": "ahlv pstg ibnv elsm"},
+        {"name": "Clémence Joly", "email": "clemence@merciraymond.fr", "password": "clef gwtu cbrm vsry"},
+        {"name": "Hugo Meunier", "email": "hugo@merciraymond.fr", "password": "rayq gdyj vaec jmrb"},
+    ]
+    path = _users_file_path()
+    if not path.exists():
+        return base
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            extra = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return base
+    if not isinstance(extra, list):
+        return base
+    seen = {u["email"].strip().lower() for u in base}
+    out = list(base)
+    for u in extra:
+        if not isinstance(u, dict):
+            continue
+        name = (u.get("name") or "").strip()
+        email = (u.get("email") or "").strip()
+        password = (u.get("password") or "").strip()
+        if not name or not email:
+            continue
+        if email.lower() in seen:
+            continue
+        seen.add(email.lower())
+        out.append({"name": name, "email": email, "password": password})
+    return out
+
+
+def _append_user_to_file(name: str, email: str, password: str) -> Optional[str]:
+    """Append one user to users.json. Returns None on success, error message on failure."""
+    path = _users_file_path()
+    extra = []
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                extra = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+        if not isinstance(extra, list):
+            extra = []
+    extra.append({"name": name.strip(), "email": email.strip(), "password": password.strip()})
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(extra, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        return str(e)
+    return None
+
+
 def main():
     st.markdown('<h1 class="main-header">🌱 MERCI RAYMOND - Raymographe</h1>', unsafe_allow_html=True)
 
@@ -519,14 +606,7 @@ def main():
     # Sidebar for user selection
     st.sidebar.header("👤 Choisissez un Utilisateur")
 
-    # Hardcoded user credentials
-    USERS = [
-        {"name": "Salomé Cremona", "email": "salome.cremona@merciraymond.fr", "password": "kosj dkza wuku hlbo"},
-        {"name": "Taddeo Carpinelli", "email": "taddeo.carpinelli@merciraymond.fr", "password": "tdcg uymo tswu urvk"},
-        {"name": "Guillaume H.", "email": "guillaume@merciraymond.fr", "password": "ahlv pstg ibnv elsm"},
-        {"name": "Clémence Joly", "email": "clemence@merciraymond.fr", "password": "clef gwtu cbrm vsry"},
-        {"name": "Hugo Meunier", "email": "hugo@merciraymond.fr", "password": "rayq gdyj vaec jmrb"}# Add more users as needed
-    ]
+    USERS = _load_users()
 
     # Create user selection dropdown
     user_options = [user["name"] for user in USERS]
@@ -552,21 +632,47 @@ def main():
         sender_email = None
         sender_password = None
 
+    # Add user from UI
+    with st.sidebar.expander("➕ Ajouter un utilisateur"):
+        add_name = st.text_input("Nom", key="add_user_name", placeholder="Jean Dupont")
+        add_email = st.text_input("Email", key="add_user_email", placeholder="jean@exemple.fr")
+        add_password = st.text_input("Mot de passe (app password)", key="add_user_password", type="password", placeholder="xxxx xxxx xxxx xxxx")
+        if st.button("Ajouter"):
+            if not (add_name and add_email):
+                st.error("Nom et email sont obligatoires.")
+            else:
+                err = _append_user_to_file(add_name, add_email, add_password or "")
+                if err:
+                    st.error(f"Erreur: {err}")
+                else:
+                    st.success("Utilisateur ajouté. Rechargez la page pour le voir dans la liste.")
+                    st.rerun()
+
     # Main content
     tab1, tab2, tab3 = st.tabs(["📁 Upload & Preview", "🎨 Design Email", "🚀 Envoi"])
 
     with tab1:
-        st.markdown('<h2 class="step-header">Étape 1: Upload du fichier Excel</h2>', unsafe_allow_html=True)
+        st.markdown('<h2 class="step-header">Étape 1: Upload du fichier Excel ou CSV</h2>', unsafe_allow_html=True)
 
         uploaded_file = st.file_uploader(
-            "Choisissez votre fichier Excel",
-            type=['xlsx', 'xls'],
-            help="Le fichier peut contenir n'importe quelles colonnes - l'app détectera automatiquement les noms, emails, entreprises, etc."
+            "Choisissez votre fichier Excel ou CSV",
+            type=["xlsx", "xls", "csv"],
+            help="Excel ou CSV - l'app détectera automatiquement les noms, emails, entreprises, etc."
         )
 
         if uploaded_file is not None:
             try:
-                df = pd.read_excel(uploaded_file)
+                name_lower = (uploaded_file.name or "").lower()
+                if name_lower.endswith(".csv"):
+                    raw_bytes = uploaded_file.getvalue()
+                    buf = BytesIO(raw_bytes)
+                    try:
+                        df = pd.read_csv(buf, encoding="utf-8", sep=None, engine="python")
+                    except UnicodeDecodeError:
+                        buf.seek(0)
+                        df = pd.read_csv(buf, encoding="latin-1", sep=None, engine="python")
+                else:
+                    df = pd.read_excel(uploaded_file)
                 st.session_state.df = df
 
                 st.success(f"✅ Fichier chargé avec succès! {len(df)} lignes trouvées.")
@@ -593,7 +699,7 @@ def main():
                         st.write(f"- 📧 **Email détecté:** `{email_column}`")
                     else:
                         st.write("- 📧 **Email:** ❌ Non détecté")
-                        st.warning("⚠️ Aucune colonne email détectée. Veuillez vérifier votre fichier Excel.")
+                        st.warning("⚠️ Aucune colonne email détectée. Veuillez vérifier votre fichier Excel ou CSV.")
 
                     # Show all available placeholders
                     if available_placeholders:
@@ -931,7 +1037,7 @@ def main():
             else:
                 st.warning("Aucun email valide trouvé dans le fichier.")
         else:
-            st.info("Veuillez d'abord charger un fichier Excel dans l'onglet 'Upload & Preview'.")
+            st.info("Veuillez d'abord charger un fichier Excel ou CSV dans l'onglet 'Upload & Preview'.")
 
     with tab3:
         st.markdown('<h2 class="step-header">Étape 3: Envoi des emails</h2>', unsafe_allow_html=True)

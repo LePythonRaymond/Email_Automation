@@ -1,6 +1,9 @@
 # Streamlit
 .streamlit/secrets.toml
 
+# User-added senders (contains passwords)
+users.json
+
 # Python
 __pycache__/
 *.pyc
