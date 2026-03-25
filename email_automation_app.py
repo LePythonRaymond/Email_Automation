@@ -192,16 +192,56 @@ class EmailAutomation:
                     available_placeholders[f"{col}_first"] = f"{col}_first"
                     available_placeholders[f"{col}_last"] = f"{col}_last"
 
+        # Columns that hold a first name or surname only (not full "Nom Prénom" in one cell)
+        name_value_patterns = [
+            r'prenom',
+            r'prénom',
+            r'first\s*name',
+            r'firstname',
+            r'given\s*name',
+            r'forename',
+            r'nom de famille',
+            r'last\s*name',
+            r'lastname',
+            r'surname',
+            r'family\s*name',
+            r'surnom',
+            r'nom\s*2',
+            r'prenom\s*2',
+            r'prénom\s*2',
+        ]
+        name_value_columns = []
+        for col in columns:
+            if col == email_column or col in full_name_columns:
+                continue
+            col_lower = col.lower().strip()
+            if col_lower == 'nom':
+                name_value_columns.append(col)
+                continue
+            for pattern in name_value_patterns:
+                if re.search(pattern, col_lower, re.I):
+                    name_value_columns.append(col)
+                    break
+
         return {
             'email_column': email_column,
             'available_placeholders': available_placeholders,
             'full_name_columns': full_name_columns,
+            'name_value_columns': name_value_columns,
             'all_columns': columns
         }
 
-    def extract_contact_info(self, row: pd.Series, email_column: str, available_placeholders: Dict[str, str], full_name_columns: List[str] = None) -> Dict[str, str]:
+    def extract_contact_info(
+        self,
+        row: pd.Series,
+        email_column: str,
+        available_placeholders: Dict[str, str],
+        full_name_columns: List[str] = None,
+        name_value_columns: List[str] = None,
+    ) -> Dict[str, str]:
         """Extract all contact information from a row dynamically."""
         info = {}
+        name_value_columns = name_value_columns or []
 
         # Extract email
         if email_column and email_column in row.index:
@@ -237,6 +277,13 @@ class EmailAutomation:
                     else:
                         info[f"{full_name_col}_last"] = ""
 
+        # Proper case for separate first-name / surname columns (Prénom, Nom, etc.)
+        for col in name_value_columns:
+            if col in row.index and pd.notna(row[col]):
+                raw = str(row[col]).strip()
+                if raw:
+                    info[col] = to_name_case(raw)
+
         return info
 
     def get_valid_emails_from_df(self, df: pd.DataFrame) -> List[Dict[str, str]]:
@@ -248,11 +295,18 @@ class EmailAutomation:
         email_column = mapping['email_column']
         available_placeholders = mapping['available_placeholders']
         full_name_columns = mapping['full_name_columns']
+        name_value_columns = mapping.get('name_value_columns', [])
 
         valid_contacts = []
 
         for idx, row in df.iterrows():
-            contact_info = self.extract_contact_info(row, email_column, available_placeholders, full_name_columns)
+            contact_info = self.extract_contact_info(
+                row,
+                email_column,
+                available_placeholders,
+                full_name_columns,
+                name_value_columns=name_value_columns,
+            )
 
             # Check if we have a valid email
             if contact_info.get('email') and re.search(email_pattern, contact_info['email']):
@@ -588,6 +642,81 @@ def _append_user_to_file(name: str, email: str, password: str) -> Optional[str]:
     return None
 
 
+# --- Saved uploads (images/files) for reuse ---
+UPLOADED_ASSETS_DIR = Path(__file__).resolve().parent / "uploaded_assets"
+DECORATIVE_SUBDIR = "decorative"
+ATTACHMENTS_SUBDIR = "attachments"
+
+
+def _uploaded_assets_path(subdir: str) -> Path:
+    path = UPLOADED_ASSETS_DIR / subdir
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _save_uploaded_file(upload, subdir: str) -> Optional[Path]:
+    """Save an uploaded file (Streamlit UploadedFile) to uploaded_assets/subdir. Returns path or None on error."""
+    if upload is None:
+        return None
+    try:
+        folder = _uploaded_assets_path(subdir)
+        name = (upload.name or "file").strip() or "file"
+        # Sanitize and avoid overwrite: base_timestamp.ext
+        base, ext = os.path.splitext(name)
+        base = re.sub(r"[^\w\-.]", "_", base)[:80] or "file"
+        ext = (ext or ".bin").lower()
+        path = folder / f"{base}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"
+        path.write_bytes(upload.getvalue())
+        return path
+    except Exception:
+        return None
+
+
+def _list_saved_files(subdir: str) -> List[Tuple[str, Path]]:
+    """Return list of (display_name, path) for files in uploaded_assets/subdir, newest first."""
+    folder = UPLOADED_ASSETS_DIR / subdir
+    if not folder.exists():
+        return []
+    out = []
+    for p in folder.iterdir():
+        if p.is_file():
+            out.append((p.name, p))
+    out.sort(key=lambda x: x[1].stat().st_mtime, reverse=True)
+    return out
+
+
+class _FileLikeFromPath:
+    """Wrap a file path as a file-like object with .getvalue(), .name, .type, .read(), .seek() for downstream code."""
+
+    def __init__(self, path: Path):
+        self._path = Path(path)
+        self.name = self._path.name
+        ext = self._path.suffix.lower()
+        self.type = {
+            "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif",
+            "pdf": "application/pdf", "doc": "application/msword", "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "xls": "application/vnd.ms-excel", "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "txt": "text/plain",
+        }.get(ext, "application/octet-stream")
+        self._bytes = None
+
+    def getvalue(self):
+        if self._bytes is None:
+            self._bytes = self._path.read_bytes()
+        return self._bytes
+
+    def read(self):
+        return self.getvalue()
+
+    def seek(self, pos):
+        pass
+
+
+def _load_saved_file(path: Path):
+    """Return a file-like object for the given path (for use as decorative_image_file or attachment)."""
+    return _FileLikeFromPath(path)
+
+
 def main():
     st.markdown('<h1 class="main-header">🌱 MERCI RAYMOND - Raymographe</h1>', unsafe_allow_html=True)
 
@@ -881,11 +1010,52 @@ def main():
         st.divider()
 
         # Visual elements section
+        if 'saved_decorative_choice' not in st.session_state:
+            st.session_state.saved_decorative_choice = None
+
         decorative_image_file = st.file_uploader(
             "Image décorative",
             type=['png', 'jpg', 'jpeg'],
-            help="Image qui apparaîtra dans le corps de l'email HTML"
+            help="Image qui apparaîtra dans le corps de l'email HTML. Elle sera enregistrée pour réutilisation ultérieure."
         )
+
+        # Save new upload and persist; or allow picking a saved image
+        if decorative_image_file:
+            saved_path = _save_uploaded_file(decorative_image_file, DECORATIVE_SUBDIR)
+            st.session_state.decorative_image_file = decorative_image_file
+            st.session_state.saved_decorative_choice = None
+            if saved_path:
+                st.success("✅ Image décorative chargée et enregistrée pour plus tard.")
+            else:
+                st.success("✅ Image décorative chargée")
+        else:
+            saved_list = _list_saved_files(DECORATIVE_SUBDIR)
+            options = ["— Aucune —"] + [name for name, _ in saved_list]
+            idx = 0
+            if st.session_state.saved_decorative_choice:
+                for i, (name, _) in enumerate(saved_list):
+                    if name == st.session_state.saved_decorative_choice:
+                        idx = i + 1
+                        break
+            chosen = st.selectbox(
+                "Ou utiliser une image enregistrée",
+                options=options,
+                index=idx,
+                key="saved_decorative_select"
+            )
+            if chosen and chosen != "— Aucune —":
+                for name, path in saved_list:
+                    if name == chosen:
+                        st.session_state.decorative_image_file = _load_saved_file(path)
+                        st.session_state.saved_decorative_choice = name
+                        break
+            else:
+                st.session_state.saved_decorative_choice = None
+                st.session_state.decorative_image_file = None
+
+        # Ensure session state key exists
+        if 'decorative_image_file' not in st.session_state:
+            st.session_state.decorative_image_file = None
 
         # Size of the main decorative image
         size_options = list(st.session_state.email_automation.decorative_image_sizes.keys())
@@ -906,24 +1076,44 @@ def main():
             "Fichiers à joindre",
             type=['pdf', 'doc', 'docx', 'xls', 'xlsx', 'png', 'jpg', 'jpeg', 'txt'],
             accept_multiple_files=True,
-            help="Sélectionnez un ou plusieurs fichiers à joindre à l'email (PDF, Word, Excel, images, etc.)"
+            help="Sélectionnez un ou plusieurs fichiers à joindre à l'email. Ils seront enregistrés pour réutilisation."
         )
 
-        # Store files in session state
-        if 'decorative_image_file' not in st.session_state:
-            st.session_state.decorative_image_file = None
+        # Store files in session state; save new attachments to disk
         if 'attachment_files' not in st.session_state:
             st.session_state.attachment_files = []
-
-        if decorative_image_file:
-            st.session_state.decorative_image_file = decorative_image_file
-            st.success("✅ Image décorative chargée")
+        if 'saved_attachment_names' not in st.session_state:
+            st.session_state.saved_attachment_names = []
 
         if attachment_files:
+            for f in attachment_files:
+                _save_uploaded_file(f, ATTACHMENTS_SUBDIR)
             st.session_state.attachment_files = attachment_files
-            st.success(f"✅ {len(attachment_files)} fichier(s) joint(s) chargé(s)")
+            st.success(f"✅ {len(attachment_files)} fichier(s) joint(s) chargé(s) et enregistrés.")
             for i, file in enumerate(attachment_files):
                 st.write(f"📎 {file.name} ({file.size} bytes)")
+
+        # Option to add from saved attachments
+        saved_att_list = _list_saved_files(ATTACHMENTS_SUBDIR)
+        if saved_att_list:
+            add_saved = st.selectbox(
+                "Fichier enregistré à ajouter",
+                options=["— Choisir —"] + [name for name, _ in saved_att_list],
+                key="add_saved_attachment"
+            )
+            if st.button("Ajouter ce fichier aux pièces jointes", key="add_saved_att_btn"):
+                if add_saved and add_saved != "— Choisir —":
+                    for name, path in saved_att_list:
+                        if name == add_saved:
+                            if any(getattr(f, "name", None) == name for f in st.session_state.attachment_files):
+                                st.info(f"« {name} » est déjà dans les pièces jointes.")
+                            else:
+                                loaded = _load_saved_file(path)
+                                st.session_state.attachment_files = list(st.session_state.attachment_files) + [loaded]
+                                st.success(f"✅ « {name} » ajouté aux pièces jointes.")
+                            break
+                else:
+                    st.warning("Choisissez un fichier dans la liste ci-dessus.")
 
         # Preview section
         st.divider()

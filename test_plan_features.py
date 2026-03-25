@@ -46,11 +46,36 @@ def test_extract_contact_info_name_case():
     placeholders = mapping["available_placeholders"]
     full_name_cols = mapping["full_name_columns"]
     row = df.iloc[0]
-    info = automation.extract_contact_info(row, email_col, placeholders, full_name_cols)
+    info = automation.extract_contact_info(
+        row, email_col, placeholders, full_name_cols, name_value_columns=mapping.get("name_value_columns", [])
+    )
     assert "Nom du contact_first" in info and info["Nom du contact_first"] == "Jean-Pierre"
     assert "Nom du contact_last" in info and info["Nom du contact_last"] == "Dupont"
     assert info.get("Nom du contact") == "Jean-Pierre Dupont"
     print("  extract_contact_info name case: OK")
+    return True
+
+
+def test_name_value_columns_prenom_nom():
+    """Separate Prénom / Nom columns get to_name_case."""
+    automation = EmailAutomation()
+    df = pd.DataFrame({
+        "email": ["x@y.fr"],
+        "Prénom": ["jean-pierre"],
+        "Nom": ["MOREAU"],
+    })
+    mapping = automation.detect_column_mapping(df)
+    row = df.iloc[0]
+    info = automation.extract_contact_info(
+        row,
+        mapping["email_column"],
+        mapping["available_placeholders"],
+        mapping["full_name_columns"],
+        name_value_columns=mapping.get("name_value_columns", []),
+    )
+    assert info.get("Prénom") == "Jean-Pierre"
+    assert info.get("Nom") == "Moreau"
+    print("  name_value_columns (Prénom/Nom): OK")
     return True
 
 
@@ -115,6 +140,7 @@ def main():
     for name, fn in [
         ("to_name_case", test_to_name_case),
         ("extract_contact_info name case", test_extract_contact_info_name_case),
+        ("name_value_columns Prénom/Nom", test_name_value_columns_prenom_nom),
         ("_load_users", test_load_users_no_file),
         ("_append_user_to_file", test_append_user_invalid),
         ("CSV loading", test_csv_loading),

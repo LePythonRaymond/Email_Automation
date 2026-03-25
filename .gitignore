@@ -4,6 +4,9 @@
 # User-added senders (contains passwords)
 users.json
 
+# Saved uploaded images/files (reusable in app)
+uploaded_assets/
+
 # Python
 __pycache__/
 *.pyc
