@@ -229,16 +229,18 @@ class EmailAutomation:
         self.base_email_content_html = ""
 
         # Gmail-style HTML template that looks like plain text - simplified for unified content
+        # Use div (not p) so block elements like <ul> from convert_markdown_to_html stay valid;
+        # <p>…<ul>… is invalid HTML and causes uneven spacing in email clients.
         self.html_template = """<div style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; line-height: 1.4; color: #202124; background: #ffffff; margin: 0; padding: 0;">
-  <p style="margin: 0 0 16px 0;">
+  <div style="margin: 0 0 16px 0;">
     {first_paragraph}
-  </p>
+  </div>
 
   {decorative_image_section}
 
-  <p style="margin: 0 0 16px 0;">
+  <div style="margin: 0 0 16px 0;">
     {second_paragraph}
-  </p>
+  </div>
 
   {logo_section}
 </div>"""
@@ -572,28 +574,49 @@ class EmailAutomation:
                 result_parts.append(''.join(list_buffer))
                 list_buffer = []
 
-        for line in lines:
+        def _line_is_list_item(raw: str) -> bool:
+            if not raw.strip():
+                return False
+            if re.match(r'^(?:    |\t)\s*- (.+)$', raw):
+                return True
+            stripped = raw.strip()
+            return bool(stripped.startswith('- ') and re.match(r'^- (.+)$', stripped))
+
+        for i, line in enumerate(lines):
             nested_match = re.match(r'^(?:    |\t)\s*- (.+)$', line)
             top_match = re.match(r'^- (.+)$', line.strip()) if not nested_match else None
+
+            # Blank lines between bullets used to close the list and become <br><br>, which
+            # looked like "double" spacing vs items without a blank line. Skip empties while
+            # still inside a list if the next non-empty line is another bullet.
+            if not line.strip() and list_depth > 0:
+                next_is_bullet = False
+                for j in range(i + 1, len(lines)):
+                    if not lines[j].strip():
+                        continue
+                    next_is_bullet = _line_is_list_item(lines[j])
+                    break
+                if next_is_bullet:
+                    continue
 
             if nested_match:
                 item_text = nested_match.group(1)
                 if list_depth == 0:
-                    list_buffer.append('<ul style="margin: 0; padding-left: 20px;">')
+                    list_buffer.append('<ul style="margin: 8px 0; padding-left: 20px;">')
                     list_depth = 1
                 if list_depth == 1:
                     list_buffer.append('<ul style="margin: 0; padding-left: 20px; list-style-type: circle;">')
                     list_depth = 2
-                list_buffer.append(f'<li style="margin: 0; padding: 1px 0;">{item_text}</li>')
+                list_buffer.append('<li style="margin: 0 0 6px 0; padding: 0;">' + item_text + '</li>')
             elif top_match and line.strip().startswith('- '):
                 item_text = top_match.group(1)
                 if list_depth == 2:
                     list_buffer.append('</ul>')
                     list_depth = 1
                 if list_depth == 0:
-                    list_buffer.append('<ul style="margin: 0; padding-left: 20px;">')
+                    list_buffer.append('<ul style="margin: 8px 0; padding-left: 20px;">')
                     list_depth = 1
-                list_buffer.append(f'<li style="margin: 0; padding: 1px 0;">{item_text}</li>')
+                list_buffer.append('<li style="margin: 0 0 6px 0; padding: 0;">' + item_text + '</li>')
             else:
                 while list_depth > 0:
                     list_buffer.append('</ul>')
