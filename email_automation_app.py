@@ -1160,14 +1160,59 @@ def main():
             if st.session_state.get('notion_sites'):
                 sites = st.session_state.notion_sites
 
-                # Build editable DataFrame with checkboxes
+                # --- Classify sites as INT, EXT, or INT/EXT ---
+                def _classify_site(name: str) -> str:
+                    lower = name.lower()
+                    if '(int/ext)' in lower or '(ext/int)' in lower:
+                        return 'INT/EXT'
+                    elif '(int)' in lower:
+                        return 'INT'
+                    elif '(ext)' in lower:
+                        return 'EXT'
+                    return 'AUTRE'
+
+                site_types = [_classify_site(s["site"]) for s in sites]
+
+                # --- Filter radio ---
+                site_filter = st.radio(
+                    "Filtrer par type :",
+                    options=["Tous", "Exterieur (EXT)", "Interieur (INT)"],
+                    horizontal=True,
+                    key="notion_site_filter",
+                )
+
+                # Determine which sites to show and their default selection
+                has_mixed = any(t == 'INT/EXT' for t in site_types)
+
+                if site_filter == "Tous":
+                    # Show all, all selected
+                    display_indices = list(range(len(sites)))
+                    default_selected = [True] * len(sites)
+                elif site_filter == "Exterieur (EXT)":
+                    # Show EXT + INT/EXT (INT/EXT unchecked at top)
+                    mixed_idx = [i for i, t in enumerate(site_types) if t == 'INT/EXT']
+                    ext_idx = [i for i, t in enumerate(site_types) if t == 'EXT']
+                    display_indices = mixed_idx + ext_idx
+                    default_selected = [False] * len(mixed_idx) + [True] * len(ext_idx)
+                else:  # Interieur (INT)
+                    # Show INT + INT/EXT (INT/EXT unchecked at top)
+                    mixed_idx = [i for i, t in enumerate(site_types) if t == 'INT/EXT']
+                    int_idx = [i for i, t in enumerate(site_types) if t == 'INT']
+                    display_indices = mixed_idx + int_idx
+                    default_selected = [False] * len(mixed_idx) + [True] * len(int_idx)
+
+                # Show warning about INT/EXT sites if filtering
+                if site_filter != "Tous" and has_mixed:
+                    st.warning("Certains sites sont a la fois INT et EXT. Ils apparaissent en haut de la liste, non-selectionnes. Cochez ceux qui sont pertinents pour cet envoi.")
+
+                # Build editable DataFrame for displayed sites
                 sites_df = pd.DataFrame({
-                    "Selectionne": [True] * len(sites),
-                    "Site": [s["site"] for s in sites],
-                    "Email": [s["email"] for s in sites],
+                    "Selectionne": default_selected,
+                    "Site": [sites[i]["site"] for i in display_indices],
+                    "Email": [sites[i]["email"] for i in display_indices],
                 })
 
-                st.markdown(f"**{len(sites)} sites trouves.** Deselectionnez ceux que vous ne souhaitez pas inclure :")
+                st.markdown(f"**{len(display_indices)} sites affiches.** Deselectionnez ceux que vous ne souhaitez pas inclure :")
 
                 edited_sites = st.data_editor(
                     sites_df,
@@ -1178,7 +1223,7 @@ def main():
                     },
                     hide_index=True,
                     use_container_width=True,
-                    key="notion_sites_editor",
+                    key=f"notion_sites_editor_{site_filter}",
                 )
 
                 # Count selected
