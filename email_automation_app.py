@@ -15,6 +15,7 @@ import time
 import base64
 import random
 import html2text
+import requests
 from io import BytesIO
 from datetime import datetime, timedelta
 
@@ -78,6 +79,20 @@ st.markdown("""
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
+# Notion API Configuration
+# Load from environment variable, or from .env file if not set
+NOTION_API_KEY = os.environ.get("NOTION_API_KEY", "")
+if not NOTION_API_KEY:
+    _env_path = Path(__file__).parent / ".env"
+    if _env_path.exists():
+        for _line in _env_path.read_text().splitlines():
+            if _line.startswith("NOTION_API_KEY="):
+                NOTION_API_KEY = _line.split("=", 1)[1].strip().strip('"')
+                break
+NOTION_DS_ID = "285d9278-02d7-808a-9395-000b04dfc654"
+NOTION_API_VERSION_LEGACY = "2022-06-28"
+NOTION_API_VERSION_DS = "2025-09-03"
+
 
 def to_name_case(s: str) -> str:
     """Format a name in proper case: first letter of each part capitalized, rest lower (e.g. JEAN-PIERRE -> Jean-Pierre, françois moreau -> François Moreau)."""
@@ -97,6 +112,109 @@ def to_name_case(s: str) -> str:
                 capped.append(p[0].upper() + p[1:].lower())
         result.append("-".join(capped))
     return " ".join(result)
+
+
+def fetch_notion_sites() -> List[Dict[str, str]]:
+    """Fetch all sites from the Notion 'site d'entretien' data source.
+    Returns a list of dicts: [{"site": "...", "email": "..."}, ...]
+    Handles pagination and API version fallback (data source vs legacy database).
+    """
+    headers_ds = {
+        "Authorization": f"Bearer {NOTION_API_KEY}",
+        "Notion-Version": NOTION_API_VERSION_DS,
+        "Content-Type": "application/json",
+    }
+    headers_legacy = {
+        "Authorization": f"Bearer {NOTION_API_KEY}",
+        "Notion-Version": NOTION_API_VERSION_LEGACY,
+        "Content-Type": "application/json",
+    }
+
+    def _extract_sites_from_results(results: list) -> List[Dict[str, str]]:
+        """Extract site name and email from Notion page results.
+        The 'mail rapport et autre' property is rich_text type (not email type).
+        """
+        sites = []
+        for page in results:
+            props = page.get("properties", {})
+            site_name = None
+            email_value = None
+
+            # Extract title (site name) - find by type
+            for prop_name, prop_data in props.items():
+                if prop_data.get("type") == "title":
+                    title_items = prop_data.get("title", [])
+                    if title_items:
+                        site_name = "".join(item.get("plain_text", "") for item in title_items)
+                    break
+
+            # Extract email from "mail rapport et autre" (rich_text type)
+            mail_prop = props.get("mail rapport et autre", {})
+            if mail_prop.get("type") == "rich_text":
+                rt_items = mail_prop.get("rich_text", [])
+                if rt_items:
+                    email_value = "".join(item.get("plain_text", "") for item in rt_items).strip()
+
+            # Fallback: try "email" type property if rich_text didn't work
+            if not email_value:
+                for prop_name, prop_data in props.items():
+                    if prop_data.get("type") == "email" and prop_data.get("email"):
+                        email_value = prop_data["email"]
+                        break
+
+            if site_name:
+                sites.append({"site": site_name, "email": email_value or ""})
+        return sites
+
+    def _query_with_pagination(url: str, headers: dict) -> List[Dict[str, str]]:
+        """Query a Notion endpoint with pagination and extract sites."""
+        all_sites = []
+        start_cursor = None
+        while True:
+            body = {}
+            if start_cursor:
+                body["start_cursor"] = start_cursor
+            resp = requests.post(url, headers=headers, json=body, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            all_sites.extend(_extract_sites_from_results(data.get("results", [])))
+            if data.get("has_more"):
+                start_cursor = data.get("next_cursor")
+            else:
+                break
+        return all_sites
+
+    # Try data source endpoint first
+    ds_url = f"https://api.notion.com/v1/data_sources/{NOTION_DS_ID}/query"
+    try:
+        return _query_with_pagination(ds_url, headers_ds)
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 400:
+            pass  # Fall through to legacy
+        else:
+            raise
+
+    # Fallback: try as legacy database
+    db_url = f"https://api.notion.com/v1/databases/{NOTION_DS_ID}/query"
+    try:
+        return _query_with_pagination(db_url, headers_legacy)
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 400:
+            pass  # Fall through to data source discovery
+        else:
+            raise
+
+    # Last fallback: discover data source ID from database metadata
+    meta_url = f"https://api.notion.com/v1/databases/{NOTION_DS_ID}"
+    resp = requests.get(meta_url, headers=headers_ds, timeout=30)
+    resp.raise_for_status()
+    meta = resp.json()
+    data_sources = meta.get("data_sources", [])
+    if not data_sources:
+        raise ValueError("Impossible de trouver la source de donnees Notion. Verifiez l'ID.")
+    real_ds_id = data_sources[0].get("id")
+    real_ds_url = f"https://api.notion.com/v1/data_sources/{real_ds_id}/query"
+    return _query_with_pagination(real_ds_url, headers_ds)
 
 
 class EmailAutomation:
@@ -402,12 +520,47 @@ class EmailAutomation:
             return image_file
 
     def convert_markdown_to_html(self, text: str) -> str:
-        """Convert markdown-style formatting to HTML for email"""
-        # Convert **bold text** to <strong>bold text</strong>
+        """Convert markdown-style formatting to HTML for email.
+        Supports: **bold**, *italic*, - bullet lists, {color:name}text{/color}
+        Also converts remaining \\n to <br> (outside of list blocks).
+        """
+        # 1. Convert color syntax: {color:red}text{/color} -> <span style="color:red">text</span>
+        text = re.sub(
+            r'\{color:([^}]+)\}(.*?)\{/color\}',
+            r'<span style="color:\1">\2</span>',
+            text,
+            flags=re.DOTALL
+        )
+
+        # 2. Convert bullet lists: consecutive lines starting with "- " become <ul><li>...</li></ul>
+        lines = text.split('\n')
+        result_lines = []
+        in_list = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('- '):
+                if not in_list:
+                    result_lines.append('<ul style="margin: 8px 0; padding-left: 24px;">')
+                    in_list = True
+                item_text = stripped[2:]
+                result_lines.append(f'<li style="margin: 4px 0;">{item_text}</li>')
+            else:
+                if in_list:
+                    result_lines.append('</ul>')
+                    in_list = False
+                result_lines.append(line)
+        if in_list:
+            result_lines.append('</ul>')
+        text = '\n'.join(result_lines)
+
+        # 3. Convert **bold text** to <strong>bold text</strong>
         text = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', text)
 
-        # Convert *italic text* to <em>italic text</em>
+        # 4. Convert *italic text* to <em>italic text</em>
         text = re.sub(r'\*(.*?)\*', r'<em>\1</em>', text)
+
+        # 5. Convert remaining \n to <br>
+        text = text.replace('\n', '<br>')
 
         return text
 
@@ -506,11 +659,7 @@ class EmailAutomation:
             first_paragraph = first_paragraph.strip()
             second_paragraph = second_paragraph.strip()
 
-            # Convert line breaks to <br> tags for HTML
-            first_paragraph = first_paragraph.replace('\n', '<br>')
-            second_paragraph = second_paragraph.replace('\n', '<br>')
-
-            # Convert markdown-style bold text to HTML
+            # Convert markdown formatting and line breaks to HTML
             first_paragraph = self.convert_markdown_to_html(first_paragraph)
             second_paragraph = self.convert_markdown_to_html(second_paragraph)
 
@@ -731,19 +880,35 @@ def main():
         st.session_state.edited_invalid_emails = {}
     if 'validated_invalid_emails' not in st.session_state:
         st.session_state.validated_invalid_emails = []
+    if 'notion_sites' not in st.session_state:
+        st.session_state.notion_sites = None
 
     # Sidebar for user selection
     st.sidebar.header("👤 Choisissez un Utilisateur")
+
+    if st.session_state.pop("user_just_added_notice", False):
+        st.sidebar.success("✅ Utilisateur ajouté avec succès — vous êtes maintenant sur ce profil.")
+        try:
+            st.toast("Utilisateur ajouté !", icon="✅")
+        except Exception:
+            pass
 
     USERS = _load_users()
 
     # Create user selection dropdown
     user_options = [user["name"] for user in USERS]
     if user_options:
+        if (
+            "utilisateur_select" in st.session_state
+            and st.session_state.utilisateur_select not in user_options
+        ):
+            st.session_state.utilisateur_select = user_options[0]
+
         selected_user_name = st.sidebar.selectbox(
             "Utilisateur",
             options=user_options,
-            help="Sélectionnez l'utilisateur pour l'envoi des emails"
+            help="Sélectionnez l'utilisateur pour l'envoi des emails",
+            key="utilisateur_select",
         )
 
         # Find selected user and store credentials in session state
@@ -774,127 +939,206 @@ def main():
                 if err:
                     st.error(f"Erreur: {err}")
                 else:
-                    st.success("Utilisateur ajouté. Rechargez la page pour le voir dans la liste.")
+                    new_name = add_name.strip()
+                    st.session_state.utilisateur_select = new_name
+                    st.session_state.user_just_added_notice = True
+                    for k in ("add_user_name", "add_user_email", "add_user_password"):
+                        if k in st.session_state:
+                            st.session_state[k] = ""
+                    try:
+                        st.balloons()
+                    except Exception:
+                        pass
                     st.rerun()
 
     # Main content
     tab1, tab2, tab3 = st.tabs(["📁 Upload & Preview", "🎨 Design Email", "🚀 Envoi"])
 
-    with tab1:
-        st.markdown('<h2 class="step-header">Étape 1: Upload du fichier Excel ou CSV</h2>', unsafe_allow_html=True)
+    # --- Helper: process a DataFrame (column detection, stats, store contacts) ---
+    def _display_dataframe_results(df: pd.DataFrame):
+        """Process a loaded DataFrame: detect columns, extract emails, show stats."""
+        st.session_state.df = df
 
-        uploaded_file = st.file_uploader(
-            "Choisissez votre fichier Excel ou CSV",
-            type=["xlsx", "xls", "csv"],
-            help="Excel ou CSV - l'app détectera automatiquement les noms, emails, entreprises, etc."
+        st.success(f"Donnees chargees avec succes! {len(df)} lignes trouvees.")
+
+        # Show preview
+        st.subheader("Apercu des donnees")
+        st.dataframe(df.head(10))
+
+        # Detect column mapping and show it
+        mapping = st.session_state.email_automation.detect_column_mapping(df)
+        email_column = mapping['email_column']
+        available_placeholders = mapping['available_placeholders']
+        full_name_columns = mapping['full_name_columns']
+        all_columns = mapping['all_columns']
+
+        st.subheader("Detection automatique des colonnes")
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.write("**Colonnes detectees:**")
+
+            # Show detected email column
+            if email_column:
+                st.write(f"- **Email detecte:** `{email_column}`")
+            else:
+                st.write("- **Email:** Non detecte")
+                st.warning("Aucune colonne email detectee. Veuillez verifier votre fichier.")
+
+            # Show all available placeholders
+            if available_placeholders:
+                st.write("**Placeholders disponibles:**")
+
+                # Group placeholders by type
+                regular_placeholders = []
+                name_placeholders = {}
+
+                for col_name in available_placeholders.keys():
+                    if col_name.endswith('_first') or col_name.endswith('_last'):
+                        base_name = col_name.replace('_first', '').replace('_last', '')
+                        if base_name not in name_placeholders:
+                            name_placeholders[base_name] = {'first': None, 'last': None, 'full': None}
+
+                        if col_name.endswith('_first'):
+                            name_placeholders[base_name]['first'] = col_name
+                        elif col_name.endswith('_last'):
+                            name_placeholders[base_name]['last'] = col_name
+                    else:
+                        regular_placeholders.append(col_name)
+
+                # Show regular placeholders
+                for col_name in regular_placeholders:
+                    st.write(f"- `{{{col_name}}}`")
+
+                # Show name placeholders in groups
+                for base_name, placeholders in name_placeholders.items():
+                    if placeholders['first'] and placeholders['last']:
+                        st.write(f"- **{base_name}:** `{{{base_name}}}` (nom complet), `{{{placeholders['first']}}}` (prenom), `{{{placeholders['last']}}}` (nom de famille)")
+            else:
+                st.write("**Placeholders:** Aucun (seulement email)")
+
+        # Get valid emails using new system
+        valid_contacts = st.session_state.email_automation.get_valid_emails_from_df(df)
+
+        with col2:
+            st.write("**Statistiques:**")
+            st.metric("Total lignes", len(df))
+            st.metric("Emails valides", len(valid_contacts))
+            if len(df) > 0:
+                st.metric("Taux email", f"{len(valid_contacts)/len(df)*100:.1f}%")
+
+            # Show duplicate removal info
+            duplicates_removed = st.session_state.get('duplicates_removed', 0)
+            if duplicates_removed > 0:
+                st.metric("Doublons retires", duplicates_removed)
+                st.info(f"{len(valid_contacts)} emails uniques (dont {duplicates_removed} doublons retires)")
+            else:
+                st.info(f"{len(valid_contacts)} emails uniques")
+
+        # Show user guidance
+        if email_column and available_placeholders:
+            placeholder_list = ", ".join([f"`{{{col}}}`" for col in available_placeholders.keys()])
+        elif email_column:
+            st.info("**Email detecte!** Vous pouvez personnaliser vos emails avec les donnees de cette colonne.")
+        else:
+            st.error("**Aucune colonne email detectee.** Verifiez que votre fichier contient une colonne avec des adresses email.")
+
+        # Store valid contacts for later use
+        st.session_state.valid_contacts = valid_contacts
+
+    # --- Tab 1: Upload & Preview ---
+    with tab1:
+        st.markdown('<h2 class="step-header">Etape 1: Source des donnees</h2>', unsafe_allow_html=True)
+
+        data_source = st.radio(
+            "Choisissez la source de donnees :",
+            options=["Fichier Excel / CSV", "Base Entretien (Notion)"],
+            horizontal=True,
+            key="data_source_choice"
         )
 
-        if uploaded_file is not None:
-            try:
-                name_lower = (uploaded_file.name or "").lower()
-                if name_lower.endswith(".csv"):
-                    raw_bytes = uploaded_file.getvalue()
-                    buf = BytesIO(raw_bytes)
+        st.divider()
+
+        if data_source == "Fichier Excel / CSV":
+            uploaded_file = st.file_uploader(
+                "Choisissez votre fichier Excel ou CSV",
+                type=["xlsx", "xls", "csv"],
+                help="Excel ou CSV - l'app detectera automatiquement les noms, emails, entreprises, etc."
+            )
+
+            if uploaded_file is not None:
+                try:
+                    name_lower = (uploaded_file.name or "").lower()
+                    if name_lower.endswith(".csv"):
+                        raw_bytes = uploaded_file.getvalue()
+                        buf = BytesIO(raw_bytes)
+                        try:
+                            df = pd.read_csv(buf, encoding="utf-8", sep=None, engine="python")
+                        except UnicodeDecodeError:
+                            buf.seek(0)
+                            df = pd.read_csv(buf, encoding="latin-1", sep=None, engine="python")
+                    else:
+                        df = pd.read_excel(uploaded_file)
+
+                    _display_dataframe_results(df)
+
+                except Exception as e:
+                    st.error(f"Erreur lors du chargement: {e}")
+
+        else:  # Base Entretien (Notion)
+            st.markdown("**Charger les sites depuis la base Notion Entretien**")
+
+            if st.button("Charger les sites", key="load_notion_sites"):
+                with st.spinner("Chargement des sites depuis Notion..."):
                     try:
-                        df = pd.read_csv(buf, encoding="utf-8", sep=None, engine="python")
-                    except UnicodeDecodeError:
-                        buf.seek(0)
-                        df = pd.read_csv(buf, encoding="latin-1", sep=None, engine="python")
-                else:
-                    df = pd.read_excel(uploaded_file)
-                st.session_state.df = df
+                        sites = fetch_notion_sites()
+                        if sites:
+                            st.session_state.notion_sites = sites
+                        else:
+                            st.warning("Aucun site trouve dans la base Notion.")
+                            st.session_state.notion_sites = None
+                    except Exception as e:
+                        st.error(f"Erreur lors du chargement depuis Notion: {e}")
+                        st.session_state.notion_sites = None
 
-                st.success(f"✅ Fichier chargé avec succès! {len(df)} lignes trouvées.")
+            # Display sites if loaded
+            if st.session_state.get('notion_sites'):
+                sites = st.session_state.notion_sites
 
-                # Show preview
-                st.subheader("Aperçu des données")
-                st.dataframe(df.head(10))
+                # Build editable DataFrame with checkboxes
+                sites_df = pd.DataFrame({
+                    "Selectionne": [True] * len(sites),
+                    "Site": [s["site"] for s in sites],
+                    "Email": [s["email"] for s in sites],
+                })
 
-                # Detect column mapping and show it
-                mapping = st.session_state.email_automation.detect_column_mapping(df)
-                email_column = mapping['email_column']
-                available_placeholders = mapping['available_placeholders']
-                full_name_columns = mapping['full_name_columns']
-                all_columns = mapping['all_columns']
+                st.markdown(f"**{len(sites)} sites trouves.** Deselectionnez ceux que vous ne souhaitez pas inclure :")
 
-                st.subheader("🔍 Détection automatique des colonnes")
-                col1, col2 = st.columns(2)
+                edited_sites = st.data_editor(
+                    sites_df,
+                    column_config={
+                        "Selectionne": st.column_config.CheckboxColumn("Selectionne", default=True),
+                        "Site": st.column_config.TextColumn("Site", disabled=True),
+                        "Email": st.column_config.TextColumn("Email", disabled=True),
+                    },
+                    hide_index=True,
+                    use_container_width=True,
+                    key="notion_sites_editor",
+                )
 
-                with col1:
-                    st.write("**Colonnes détectées:**")
+                # Count selected
+                selected = edited_sites[edited_sites["Selectionne"] == True]
+                selected_with_email = selected[selected["Email"].str.strip().astype(bool)]
+                st.info(f"{len(selected)} sites selectionnes dont {len(selected_with_email)} avec un email valide")
 
-                    # Show detected email column
-                    if email_column:
-                        st.write(f"- 📧 **Email détecté:** `{email_column}`")
+                if st.button("Utiliser la selection", type="primary", key="use_notion_selection"):
+                    if len(selected) == 0:
+                        st.warning("Veuillez selectionner au moins un site.")
                     else:
-                        st.write("- 📧 **Email:** ❌ Non détecté")
-                        st.warning("⚠️ Aucune colonne email détectée. Veuillez vérifier votre fichier Excel ou CSV.")
-
-                    # Show all available placeholders
-                    if available_placeholders:
-                        st.write("**Placeholders disponibles:**")
-
-                        # Group placeholders by type
-                        regular_placeholders = []
-                        name_placeholders = {}
-
-                        for col_name in available_placeholders.keys():
-                            if col_name.endswith('_first') or col_name.endswith('_last'):
-                                base_name = col_name.replace('_first', '').replace('_last', '')
-                                if base_name not in name_placeholders:
-                                    name_placeholders[base_name] = {'first': None, 'last': None, 'full': None}
-
-                                if col_name.endswith('_first'):
-                                    name_placeholders[base_name]['first'] = col_name
-                                elif col_name.endswith('_last'):
-                                    name_placeholders[base_name]['last'] = col_name
-                            else:
-                                regular_placeholders.append(col_name)
-
-                        # Show regular placeholders
-                        for col_name in regular_placeholders:
-                            st.write(f"- `{{{col_name}}}`")
-
-                        # Show name placeholders in groups
-                        for base_name, placeholders in name_placeholders.items():
-                            if placeholders['first'] and placeholders['last']:
-                                st.write(f"- **{base_name}:** `{{{base_name}}}` (nom complet), `{{{placeholders['first']}}}` (prénom), `{{{placeholders['last']}}}` (nom de famille)")
-                    else:
-                        st.write("**Placeholders:** Aucun (seulement email)")
-
-                # Get valid emails using new system
-                valid_contacts = st.session_state.email_automation.get_valid_emails_from_df(df)
-
-                with col2:
-                    st.write("**Statistiques:**")
-                    st.metric("Total lignes", len(df))
-                    st.metric("Emails valides", len(valid_contacts))
-                    if len(df) > 0:
-                        st.metric("Taux email", f"{len(valid_contacts)/len(df)*100:.1f}%")
-
-                    # Show duplicate removal info
-                    duplicates_removed = st.session_state.get('duplicates_removed', 0)
-                    if duplicates_removed > 0:
-                        st.metric("Doublons retirés", duplicates_removed)
-                        st.info(f"📧 {len(valid_contacts)} emails uniques (dont {duplicates_removed} doublons retirés)")
-                    else:
-                        st.info(f"📧 {len(valid_contacts)} emails uniques")
-
-                # Show user guidance
-                if email_column and available_placeholders:
-                    placeholder_list = ", ".join([f"`{{{col}}}`" for col in available_placeholders.keys()])
-                elif email_column:
-                    st.info("💡 **Email détecté!** Vous pouvez personnaliser vos emails avec les données de cette colonne.")
-                else:
-                    st.error("❌ **Aucune colonne email détectée.** Vérifiez que votre fichier contient une colonne avec des adresses email.")
-
-
-
-                # Store valid contacts for later use
-                st.session_state.valid_contacts = valid_contacts
-
-            except Exception as e:
-                st.error(f"Erreur lors du chargement: {e}")
+                        # Create a DataFrame compatible with the existing pipeline
+                        result_df = selected[["Site", "Email"]].copy()
+                        result_df = result_df.rename(columns={"Email": "email"})
+                        _display_dataframe_results(result_df)
 
     with tab2:
         st.markdown('<h2 class="step-header">Étape 2: Contenu et Design de l\'email</h2>', unsafe_allow_html=True)
@@ -933,7 +1177,7 @@ def main():
             "Modifiez le contenu complet de votre email (en-tête, contenu principal, signature):",
             value="",
             height=400,
-            help="Créez votre email complet ici. Utilisez des placeholders comme {contact_name}, {site}, etc. Utilisez **texte en gras** pour le texte en gras et *texte en italique* pour l'italique.",
+            help="Créez votre email complet ici. Utilisez des placeholders comme {contact_name}, {site}, etc. Formatage: **gras**, *italique*, - puces, {color:red}couleur{/color}.",
             key=f"email_content_{email_format}",  # Unique key per format
             placeholder=""
         )
@@ -995,9 +1239,25 @@ def main():
                 *Chargez un fichier Excel pour voir les placeholders disponibles*
                 """)
 
-            # Formatting explanation and example at the end
-            st.markdown('<p style="margin-top: 1rem;"><strong>Formatage:</strong> Utilisez <code>**texte**</code> pour le gras et <code>*texte*</code> pour l\'italique.</p>', unsafe_allow_html=True)
-            st.markdown('<p style="color: #2196F3; margin-top: 0.5rem;"><strong>Exemple:</strong> <code>**Bonjour**: *{contact_name}*</code> => <strong>Bonjour</strong>: <em>Marie</em></p>', unsafe_allow_html=True)
+            # Formatting explanation and examples at the end
+            st.markdown('''<div style="margin-top: 1rem;">
+<p><strong>Formatage disponible :</strong></p>
+<ul>
+<li><code>**texte**</code> &rarr; <strong>texte en gras</strong></li>
+<li><code>*texte*</code> &rarr; <em>texte en italique</em></li>
+<li><code>- element</code> &rarr; liste a puces (une ligne par element)</li>
+<li><code>{color:red}texte{/color}</code> &rarr; <span style="color:red">texte en couleur</span></li>
+</ul>
+<p><strong>Couleurs :</strong> noms anglais (red, blue, green, orange, purple...) ou codes hex (#FF0000, #2E7D32...)</p>
+</div>''', unsafe_allow_html=True)
+            st.markdown('''<div style="color: #2196F3; margin-top: 0.5rem;">
+<p><strong>Exemples :</strong></p>
+<ul>
+<li><code>**Bonjour** *{contact_name}*</code> &rarr; <strong>Bonjour</strong> <em>Marie</em></li>
+<li><code>- Premier point</code> (puis nouvelle ligne) <code>- Deuxieme point</code> &rarr; liste a puces</li>
+<li><code>{color:#2E7D32}texte vert{/color}</code> &rarr; <span style="color:#2E7D32">texte vert</span></li>
+</ul>
+</div>''', unsafe_allow_html=True)
 
         # Store custom email content with format awareness
         if email_content and email_content.strip():
