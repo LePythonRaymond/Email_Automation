@@ -80,15 +80,18 @@ SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
 # Notion API Configuration
-# Load from environment variable, or from .env file if not set
-NOTION_API_KEY = os.environ.get("NOTION_API_KEY", "")
-if not NOTION_API_KEY:
-    _env_path = Path(__file__).parent / ".env"
-    if _env_path.exists():
-        for _line in _env_path.read_text().splitlines():
-            if _line.startswith("NOTION_API_KEY="):
-                NOTION_API_KEY = _line.split("=", 1)[1].strip().strip('"')
-                break
+# Priority: st.secrets (Streamlit Cloud) > env var > .env file
+try:
+    NOTION_API_KEY = st.secrets["NOTION_API_KEY"]
+except (KeyError, AttributeError):
+    NOTION_API_KEY = os.environ.get("NOTION_API_KEY", "")
+    if not NOTION_API_KEY:
+        _env_path = Path(__file__).parent / ".env"
+        if _env_path.exists():
+            for _line in _env_path.read_text().splitlines():
+                if _line.startswith("NOTION_API_KEY="):
+                    NOTION_API_KEY = _line.split("=", 1)[1].strip().strip('"')
+                    break
 NOTION_DS_ID = "285d9278-02d7-808a-9395-000b04dfc654"
 NOTION_API_VERSION_LEGACY = "2022-06-28"
 NOTION_API_VERSION_DS = "2025-09-03"
