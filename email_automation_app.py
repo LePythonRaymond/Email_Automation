@@ -797,6 +797,7 @@ def _load_users() -> List[Dict[str, str]]:
         {"name": "Guillaume H.", "email": "guillaume@merciraymond.fr", "password": "ahlv pstg ibnv elsm"},
         {"name": "Clémence Joly", "email": "clemence@merciraymond.fr", "password": "clef gwtu cbrm vsry"},
         {"name": "Hugo Meunier", "email": "hugo@merciraymond.fr", "password": "rayq gdyj vaec jmrb"},
+        {"name": "Diane", "email": "dianedemagnitot@merciraymond.fr", "password": "berm pegj onet cplw"}
     ]
     path = _users_file_path()
     if not path.exists():
