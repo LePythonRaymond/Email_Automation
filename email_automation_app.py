@@ -533,7 +533,8 @@ class EmailAutomation:
     def convert_markdown_to_html(self, text: str) -> str:
         """Convert markdown-style formatting to HTML for email.
         Supports: **bold**, *italic*, - bullet lists (with nesting), {color:name}text{/color}
-        Also converts remaining \\n to <br> (outside of list blocks).
+        Blank lines between bullets add extra space before the next item (14px per empty line);
+        no blank line keeps items tighter. Remaining \\n become <br> outside list blocks.
         """
         # 1. Convert color syntax: {color:name}text{/color} -> <span style="color:...">text</span>
         # French color names mapped to professional, readable hex values
@@ -566,6 +567,8 @@ class EmailAutomation:
         result_parts = []
         list_depth = 0
         list_buffer = []  # accumulate list HTML without newlines
+        # Consecutive empty lines between two bullets (same list); applied as margin-top on next <li>
+        list_blank_run = 0
 
         def _flush_list():
             """Flush accumulated list HTML as a single block (no internal newlines)."""
@@ -582,13 +585,22 @@ class EmailAutomation:
             stripped = raw.strip()
             return bool(stripped.startswith('- ') and re.match(r'^- (.+)$', stripped))
 
+        def _li_open_tag() -> str:
+            """Margin-top encodes user-inserted blank lines between bullets (~1 line ≈ 14px each)."""
+            nonlocal list_blank_run
+            n = list_blank_run
+            list_blank_run = 0
+            top = n * 14
+            if top:
+                return f'<li style="margin: {top}px 0 6px 0; padding: 0;">'
+            return '<li style="margin: 0 0 6px 0; padding: 0;">'
+
         for i, line in enumerate(lines):
             nested_match = re.match(r'^(?:    |\t)\s*- (.+)$', line)
             top_match = re.match(r'^- (.+)$', line.strip()) if not nested_match else None
 
-            # Blank lines between bullets used to close the list and become <br><br>, which
-            # looked like "double" spacing vs items without a blank line. Skip empties while
-            # still inside a list if the next non-empty line is another bullet.
+            # Blank lines between bullets: keep one <ul>, record spacing for the next <li> instead
+            # of closing the list (which produced random <br><br> gaps) or ignoring them (uniform).
             if not line.strip() and list_depth > 0:
                 next_is_bullet = False
                 for j in range(i + 1, len(lines)):
@@ -597,6 +609,7 @@ class EmailAutomation:
                     next_is_bullet = _line_is_list_item(lines[j])
                     break
                 if next_is_bullet:
+                    list_blank_run += 1
                     continue
 
             if nested_match:
@@ -607,7 +620,7 @@ class EmailAutomation:
                 if list_depth == 1:
                     list_buffer.append('<ul style="margin: 0; padding-left: 20px; list-style-type: circle;">')
                     list_depth = 2
-                list_buffer.append('<li style="margin: 0 0 6px 0; padding: 0;">' + item_text + '</li>')
+                list_buffer.append(_li_open_tag() + item_text + '</li>')
             elif top_match and line.strip().startswith('- '):
                 item_text = top_match.group(1)
                 if list_depth == 2:
@@ -616,8 +629,9 @@ class EmailAutomation:
                 if list_depth == 0:
                     list_buffer.append('<ul style="margin: 8px 0; padding-left: 20px;">')
                     list_depth = 1
-                list_buffer.append('<li style="margin: 0 0 6px 0; padding: 0;">' + item_text + '</li>')
+                list_buffer.append(_li_open_tag() + item_text + '</li>')
             else:
+                list_blank_run = 0
                 while list_depth > 0:
                     list_buffer.append('</ul>')
                     list_depth -= 1
@@ -1370,6 +1384,7 @@ def main():
 <li><code>**texte**</code> &rarr; <strong>texte en gras</strong></li>
 <li><code>*texte*</code> &rarr; <em>texte en italique</em></li>
 <li><code>- element</code> &rarr; liste a puces (une ligne par element)</li>
+<li>Ligne(s) vide(s) entre deux puces &rarr; espacement proportionnel dans l&apos;email</li>
 <li><code>&nbsp;&nbsp;&nbsp;&nbsp;- sous-element</code> &rarr; sous-liste (4 espaces avant le tiret)</li>
 <li><code>{color:nom}texte{/color}</code> &rarr; texte en couleur</li>
 </ul>
