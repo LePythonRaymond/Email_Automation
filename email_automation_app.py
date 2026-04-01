@@ -408,7 +408,10 @@ class EmailAutomation:
         return info
 
     def get_valid_emails_from_df(self, df: pd.DataFrame) -> List[Dict[str, str]]:
-        """Extract all valid emails from the dataframe with dynamic column detection."""
+        """Extract all valid emails from the dataframe with dynamic column detection.
+        If a cell contains multiple emails (separated by newlines, semicolons, commas, or spaces),
+        each email produces a separate contact entry sharing the same row data.
+        """
         email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
 
         # Detect column mapping
@@ -429,12 +432,15 @@ class EmailAutomation:
                 name_value_columns=name_value_columns,
             )
 
-            # Check if we have a valid email
-            if contact_info.get('email') and re.search(email_pattern, contact_info['email']):
-                # Create contact with all available data
+            # Extract ALL valid emails from the cell (handles multiple emails per cell)
+            raw_email = contact_info.get('email', '')
+            found_emails = re.findall(email_pattern, raw_email) if raw_email else []
+
+            for email_addr in found_emails:
+                # Create a contact entry for each email, sharing the same row data
                 contact_data = {
                     'index': idx,
-                    'email': contact_info['email']
+                    'email': email_addr.strip()
                 }
 
                 # Add all other fields dynamically
@@ -524,37 +530,83 @@ class EmailAutomation:
 
     def convert_markdown_to_html(self, text: str) -> str:
         """Convert markdown-style formatting to HTML for email.
-        Supports: **bold**, *italic*, - bullet lists, {color:name}text{/color}
+        Supports: **bold**, *italic*, - bullet lists (with nesting), {color:name}text{/color}
         Also converts remaining \\n to <br> (outside of list blocks).
         """
-        # 1. Convert color syntax: {color:red}text{/color} -> <span style="color:red">text</span>
+        # 1. Convert color syntax: {color:name}text{/color} -> <span style="color:...">text</span>
+        # French color names mapped to professional, readable hex values
+        color_map = {
+            "bleu": "#1a73e8", "rouge": "#c62828", "vert": "#2e7d32",
+            "orange": "#e65100", "violet": "#6a1b9a", "sarcelle": "#00838f",
+            "marron": "#4e342e", "ardoise": "#37474f", "framboise": "#ad1457",
+            "marine": "#1a237e",
+            # English names also supported
+            "blue": "#1a73e8", "red": "#c62828", "green": "#2e7d32",
+            "purple": "#6a1b9a", "teal": "#00838f", "brown": "#4e342e",
+            "navy": "#1a237e",
+        }
+
+        def _replace_color(m):
+            color_name = m.group(1).strip().lower()
+            color_value = color_map.get(color_name, m.group(1))  # fallback to raw value (hex codes)
+            return f'<span style="color:{color_value}">{m.group(2)}</span>'
+
         text = re.sub(
             r'\{color:([^}]+)\}(.*?)\{/color\}',
-            r'<span style="color:\1">\2</span>',
+            _replace_color,
             text,
             flags=re.DOTALL
         )
 
-        # 2. Convert bullet lists: consecutive lines starting with "- " become <ul><li>...</li></ul>
+        # 2. Convert bullet lists with nesting support
+        # "- item" = top-level, "    - item" (4+ spaces or tab) = nested
         lines = text.split('\n')
-        result_lines = []
-        in_list = False
+        result_parts = []
+        list_depth = 0
+        list_buffer = []  # accumulate list HTML without newlines
+
+        def _flush_list():
+            """Flush accumulated list HTML as a single block (no internal newlines)."""
+            nonlocal list_buffer
+            if list_buffer:
+                result_parts.append(''.join(list_buffer))
+                list_buffer = []
+
         for line in lines:
-            stripped = line.strip()
-            if stripped.startswith('- '):
-                if not in_list:
-                    result_lines.append('<ul style="margin: 8px 0; padding-left: 24px;">')
-                    in_list = True
-                item_text = stripped[2:]
-                result_lines.append(f'<li style="margin: 4px 0;">{item_text}</li>')
+            nested_match = re.match(r'^(?:    |\t)\s*- (.+)$', line)
+            top_match = re.match(r'^- (.+)$', line.strip()) if not nested_match else None
+
+            if nested_match:
+                item_text = nested_match.group(1)
+                if list_depth == 0:
+                    list_buffer.append('<ul style="margin: 0; padding-left: 20px;">')
+                    list_depth = 1
+                if list_depth == 1:
+                    list_buffer.append('<ul style="margin: 0; padding-left: 20px; list-style-type: circle;">')
+                    list_depth = 2
+                list_buffer.append(f'<li style="margin: 0; padding: 1px 0;">{item_text}</li>')
+            elif top_match and line.strip().startswith('- '):
+                item_text = top_match.group(1)
+                if list_depth == 2:
+                    list_buffer.append('</ul>')
+                    list_depth = 1
+                if list_depth == 0:
+                    list_buffer.append('<ul style="margin: 0; padding-left: 20px;">')
+                    list_depth = 1
+                list_buffer.append(f'<li style="margin: 0; padding: 1px 0;">{item_text}</li>')
             else:
-                if in_list:
-                    result_lines.append('</ul>')
-                    in_list = False
-                result_lines.append(line)
-        if in_list:
-            result_lines.append('</ul>')
-        text = '\n'.join(result_lines)
+                while list_depth > 0:
+                    list_buffer.append('</ul>')
+                    list_depth -= 1
+                _flush_list()
+                result_parts.append(line)
+
+        while list_depth > 0:
+            list_buffer.append('</ul>')
+            list_depth -= 1
+        _flush_list()
+
+        text = '\n'.join(result_parts)
 
         # 3. Convert **bold text** to <strong>bold text</strong>
         text = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', text)
@@ -1249,16 +1301,36 @@ def main():
 <li><code>**texte**</code> &rarr; <strong>texte en gras</strong></li>
 <li><code>*texte*</code> &rarr; <em>texte en italique</em></li>
 <li><code>- element</code> &rarr; liste a puces (une ligne par element)</li>
-<li><code>{color:red}texte{/color}</code> &rarr; <span style="color:red">texte en couleur</span></li>
+<li><code>&nbsp;&nbsp;&nbsp;&nbsp;- sous-element</code> &rarr; sous-liste (4 espaces avant le tiret)</li>
+<li><code>{color:nom}texte{/color}</code> &rarr; texte en couleur</li>
 </ul>
-<p><strong>Couleurs :</strong> noms anglais (red, blue, green, orange, purple...) ou codes hex (#FF0000, #2E7D32...)</p>
+</div>''', unsafe_allow_html=True)
+            st.markdown('''<div style="margin-top: 0.5rem;">
+<p><strong>Palette de couleurs :</strong></p>
+<table style="border-collapse: collapse; font-size: 13px;">
+<tr>
+<td style="padding: 3px 12px;"><span style="color:#1a73e8;">&#9632;</span> <code>bleu</code></td>
+<td style="padding: 3px 12px;"><span style="color:#c62828;">&#9632;</span> <code>rouge</code></td>
+<td style="padding: 3px 12px;"><span style="color:#2e7d32;">&#9632;</span> <code>vert</code></td>
+<td style="padding: 3px 12px;"><span style="color:#e65100;">&#9632;</span> <code>orange</code></td>
+<td style="padding: 3px 12px;"><span style="color:#6a1b9a;">&#9632;</span> <code>violet</code></td>
+</tr>
+<tr>
+<td style="padding: 3px 12px;"><span style="color:#00838f;">&#9632;</span> <code>sarcelle</code></td>
+<td style="padding: 3px 12px;"><span style="color:#4e342e;">&#9632;</span> <code>marron</code></td>
+<td style="padding: 3px 12px;"><span style="color:#37474f;">&#9632;</span> <code>ardoise</code></td>
+<td style="padding: 3px 12px;"><span style="color:#ad1457;">&#9632;</span> <code>framboise</code></td>
+<td style="padding: 3px 12px;"><span style="color:#1a237e;">&#9632;</span> <code>marine</code></td>
+</tr>
+</table>
+<p style="margin-top: 6px; font-size: 13px;">Utilisation : <code>{color:bleu}votre texte{/color}</code> &rarr; <span style="color:#1a73e8;">votre texte</span></p>
 </div>''', unsafe_allow_html=True)
             st.markdown('''<div style="color: #2196F3; margin-top: 0.5rem;">
 <p><strong>Exemples :</strong></p>
 <ul>
 <li><code>**Bonjour** *{contact_name}*</code> &rarr; <strong>Bonjour</strong> <em>Marie</em></li>
 <li><code>- Premier point</code> (puis nouvelle ligne) <code>- Deuxieme point</code> &rarr; liste a puces</li>
-<li><code>{color:#2E7D32}texte vert{/color}</code> &rarr; <span style="color:#2E7D32">texte vert</span></li>
+<li><code>{color:vert}texte vert{/color}</code> &rarr; <span style="color:#2e7d32;">texte vert</span></li>
 </ul>
 </div>''', unsafe_allow_html=True)
 
