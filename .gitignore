@@ -7,6 +7,10 @@
 # User-added senders (contains passwords)
 users.json
 
+# Deliverability state — legacy local cache (no longer the source of truth;
+# kept ignored in case a developer drops a local backup file here).
+suppression_list.json
+
 # Saved uploaded images/files (reusable in app)
 uploaded_assets/
 

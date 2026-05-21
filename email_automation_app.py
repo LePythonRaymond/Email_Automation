@@ -79,20 +79,60 @@ st.markdown("""
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
+# --- Deliverability hardening (PRD 2026-05) -------------------------------
+# Random delay between two sends (seconds). Reduces robotic sending pattern.
+MIN_DELAY_S = 1
+MAX_DELAY_S = 10
+
+# Daily cap is an unofficial team rule, not enforced in code. The team aims
+# for a soft limit (e.g. ~100 sends/sender/day) — no JSON counter file.
+
+# Inbox that receives unsubscribe requests. Must be aliased to a real mailbox
+# someone reads (or auto-forwarded), otherwise the List-Unsubscribe header
+# becomes a dead end and hurts reputation. Single source of truth: change
+# this one line and the header, footer, and detection marker all update.
+UNSUBSCRIBE_MAILTO = "desinscription@merciraymond.fr"
+
+# Footer HTML appended to every outgoing email (visible "unsubscribe" link).
+# Marker is used by _ensure_unsubscribe_footer() to avoid duplicating the
+# footer on emails that already contain it (e.g. hand-edited HTML).
+UNSUBSCRIBE_FOOTER_MARKER = f"mailto:{UNSUBSCRIBE_MAILTO}"
+UNSUBSCRIBE_FOOTER_HTML = (
+    '<div style="margin-top:24px; padding-top:12px; '
+    'border-top:1px solid #eee; font-size:11px; color:#999;">\n'
+    '  Vous recevez cet email de MERCI RAYMOND. '
+    'Pour ne plus en recevoir, '
+    f'<a href="mailto:{UNSUBSCRIBE_MAILTO}?subject=unsubscribe" '
+    'style="color:#999;">cliquez ici pour vous désinscrire</a>.\n'
+    '</div>'
+)
+# --------------------------------------------------------------------------
+
+def _read_secret_or_env(key: str) -> str:
+    """Resolve a secret: st.secrets > os.environ > .env file. Returns '' if not found."""
+    try:
+        return str(st.secrets[key])
+    except (KeyError, AttributeError, FileNotFoundError, Exception):
+        pass
+    val = os.environ.get(key, "")
+    if val:
+        return val
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            if line.startswith(f"{key}="):
+                return line.split("=", 1)[1].strip().strip('"')
+    return ""
+
+
 # Notion API Configuration
-# Priority: st.secrets (Streamlit Cloud) > env var > .env file
-try:
-    NOTION_API_KEY = st.secrets["NOTION_API_KEY"]
-except (KeyError, AttributeError):
-    NOTION_API_KEY = os.environ.get("NOTION_API_KEY", "")
-    if not NOTION_API_KEY:
-        _env_path = Path(__file__).parent / ".env"
-        if _env_path.exists():
-            for _line in _env_path.read_text().splitlines():
-                if _line.startswith("NOTION_API_KEY="):
-                    NOTION_API_KEY = _line.split("=", 1)[1].strip().strip('"')
-                    break
+NOTION_API_KEY = _read_secret_or_env("NOTION_API_KEY")
+OPENAI_API_KEY = _read_secret_or_env("OPENAI_API_KEY")
 NOTION_DS_ID = "285d9278-02d7-808a-9395-000b04dfc654"
+# ID of the Notion database (or data source) holding the suppression list.
+# Plug it in via .streamlit/secrets.toml under SUPPRESSION_NOTION_DS_ID — accepts
+# either the database ID or the data source ID, the code auto-detects.
+SUPPRESSION_NOTION_DS_ID = _read_secret_or_env("SUPPRESSION_NOTION_DS_ID")
 NOTION_API_VERSION_LEGACY = "2022-06-28"
 NOTION_API_VERSION_DS = "2025-09-03"
 
@@ -231,7 +271,8 @@ class EmailAutomation:
         # Gmail-style HTML template that looks like plain text - simplified for unified content
         # Use div (not p) so block elements like <ul> from convert_markdown_to_html stay valid;
         # <p>…<ul>… is invalid HTML and causes uneven spacing in email clients.
-        self.html_template = """<div style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; line-height: 1.4; color: #202124; background: #ffffff; margin: 0; padding: 0;">
+        self.html_template = (
+            """<div style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; line-height: 1.4; color: #202124; background: #ffffff; margin: 0; padding: 0;">
   <div style="margin: 0 0 16px 0;">
     {first_paragraph}
   </div>
@@ -243,7 +284,10 @@ class EmailAutomation:
   </div>
 
   {logo_section}
+
+  """ + UNSUBSCRIBE_FOOTER_HTML + """
 </div>"""
+        )
         # Decorative image size options: label -> CSS max-width value
         self.decorative_image_sizes = {
             "Petit (280px)": "280px",
@@ -472,7 +516,18 @@ class EmailAutomation:
         # Store duplicate count for display
         st.session_state.duplicates_removed = duplicates_removed
 
-        return unique_contacts
+        # Filter out suppressed addresses so counters stay accurate and we
+        # never even consider them downstream. Surface the count separately.
+        kept = []
+        suppressed_count = 0
+        for contact in unique_contacts:
+            if is_suppressed(contact.get('email', '')):
+                suppressed_count += 1
+            else:
+                kept.append(contact)
+        st.session_state.suppressed_removed = suppressed_count
+
+        return kept
 
     def encode_image_to_base64(self, image_file) -> Optional[str]:
         """Convert uploaded image to base64 for embedding in HTML"""
@@ -532,9 +587,30 @@ class EmailAutomation:
 
     def convert_markdown_to_html(self, text: str) -> str:
         """Convert markdown-style formatting to HTML for email.
-        Supports: **bold**, *italic*, - bullet lists (with nesting), {color:name}text{/color}
-        Also converts remaining \\n to <br> (outside of list blocks).
+        Supports: [text](url) links, **bold**, *italic*, - bullet lists (with nesting),
+        {color:name}text{/color}. Also converts remaining \\n to <br> (outside list blocks).
         """
+        # 0. Markdown links: [text](https://url) -> <a href="url" target="_blank">text</a>
+        # Only http/https URLs are accepted (mailto/tel/etc. are stripped to plain text)
+        # to keep clients out of "suspicious link" filters.
+        def _replace_link(m):
+            label = m.group(1).strip()
+            url = m.group(2).strip()
+            if not re.match(r'^https?://', url, re.IGNORECASE):
+                return label  # drop the unsafe URL, keep the label as plain text
+            # Minimal HTML-escape on the URL to stop quote-breaking in href
+            safe_url = url.replace('"', '%22').replace("'", '%27')
+            return (
+                f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer" '
+                f'style="color:#1a73e8; text-decoration:underline;">{label}</a>'
+            )
+
+        text = re.sub(
+            r'\[([^\]\n]+)\]\(([^)\s]+)\)',
+            _replace_link,
+            text,
+        )
+
         # 1. Convert color syntax: {color:name}text{/color} -> <span style="color:...">text</span>
         # French color names mapped to professional, readable hex values
         color_map = {
@@ -649,13 +725,45 @@ class EmailAutomation:
 
         return text
 
+    def _render_image_block(self, cid: str, image_file, size_css: str,
+                            show_placeholder: bool, label: str = "Image") -> str:
+        """Render the HTML block for a single inline image (or its placeholder)."""
+        img_style = (
+            f"max-width: {size_css}; width: 100%; height: auto; "
+            "border:0; outline:0; display: block;"
+        )
+        wrapper_style = (
+            f"margin: 16px 0; max-width: {size_css}; width: 100%; "
+            "box-sizing: border-box; border: 1px solid #e0e0e0; "
+            "border-radius: 4px; overflow: hidden;"
+        )
+        if image_file:
+            return (
+                f'\n                <div style="{wrapper_style}">\n'
+                f'                <img src="cid:{cid}" alt="{label}" style="{img_style}">\n'
+                f'                </div>'
+            )
+        if show_placeholder:
+            return (
+                f'\n                <div style="margin: 16px 0; max-width: {size_css}; '
+                'width: 100%; min-height: 180px; background: #f5f5f5; '
+                'border: 2px dashed #bdbdbd; border-radius: 4px; display: flex; '
+                'align-items: center; justify-content: center; color: #757575; '
+                'font-size: 13px; box-sizing: border-box;">\n'
+                f'                {label} ({size_css})\n'
+                f'                </div>'
+            )
+        return ''
+
     def personalize_email(self, contact_data: Dict[str, str], email_content: str, use_html: bool = False,
                          logo_file=None, decorative_image_file=None, attachment_files=None, email_subject: str = "",
-                         decorative_image_size: str = "100%", show_image_placeholder: bool = False) -> Tuple[str, str]:
+                         decorative_image_size: str = "100%", show_image_placeholder: bool = False,
+                         decorative_image_file_2=None, decorative_image_size_2: str = "100%") -> Tuple[str, str]:
         """
         Dynamic personalization with any column placeholders from Excel data
         Returns: (personalized_content, personalized_subject)
         decorative_image_size: CSS max-width for the main image (e.g. "280px", "100%").
+        decorative_image_file_2 / decorative_image_size_2: optional second inline image.
         show_image_placeholder: if True and no image, show a size box in preview.
         """
         # Safety check for email content - use appropriate template based on format
@@ -698,27 +806,33 @@ class EmailAutomation:
             if logo_file:
                 logo_section = f'<img src="cid:logo" alt="Merci Raymond" style="display:inline-block; height:24px; width:auto; border:0; outline:0; vertical-align:baseline;">'
 
-            # Check if {Image} placeholder exists in content
-            has_image_placeholder = '{Image}' in personalized
+            # Image 1 ({Image}) and image 2 ({Image2}) — independent sizes, separate CIDs.
+            has_img1_placeholder = '{Image}' in personalized
+            has_img2_placeholder = '{Image2}' in personalized
 
-            # Build image style with chosen size (max-width)
-            img_style = f"max-width: {decorative_image_size}; width: 100%; height: auto; border:0; outline:0; display: block;"
+            img1_html = self._render_image_block(
+                cid='decorative_image',
+                image_file=decorative_image_file,
+                size_css=decorative_image_size,
+                show_placeholder=show_image_placeholder,
+                label="Image",
+            )
+            img2_html = self._render_image_block(
+                cid='decorative_image_2',
+                image_file=decorative_image_file_2,
+                size_css=decorative_image_size_2,
+                show_placeholder=show_image_placeholder,
+                label="Image 2",
+            )
 
-            # Wrapper so the image size box is always visible (same max-width + subtle border)
-            image_wrapper_style = f"margin: 16px 0; max-width: {decorative_image_size}; width: 100%; box-sizing: border-box; border: 1px solid #e0e0e0; border-radius: 4px; overflow: hidden;"
-            # Prepare decorative image section - only if no {Image} placeholder
+            # Default auto-placement: images appear stacked between paragraphs 1 and 2
+            # when their placeholder is NOT used. Each image only contributes if it
+            # actually has content (uploaded file or preview placeholder).
             decorative_image_section = ""
-            if decorative_image_file and not has_image_placeholder:
-                decorative_image_section = f'''
-                <div style="{image_wrapper_style}">
-                <img src="cid:decorative_image" alt="Image" style="{img_style}">
-                </div>'''
-            elif show_image_placeholder and not decorative_image_file and not has_image_placeholder:
-                # Preview: show a box of the chosen size when no image is uploaded
-                decorative_image_section = f'''
-                <div style="margin: 16px 0; max-width: {decorative_image_size}; width: 100%; min-height: 180px; background: #f5f5f5; border: 2px dashed #bdbdbd; border-radius: 4px; display: flex; align-items: center; justify-content: center; color: #757575; font-size: 13px; box-sizing: border-box;">
-                Image ({decorative_image_size})
-                </div>'''
+            if not has_img1_placeholder:
+                decorative_image_section += img1_html
+            if not has_img2_placeholder:
+                decorative_image_section += img2_html
 
             # Split content into first and second paragraphs for Gmail-style layout
             paragraphs = personalized.split('\n\n')
@@ -748,21 +862,13 @@ class EmailAutomation:
             first_paragraph = self.convert_markdown_to_html(first_paragraph)
             second_paragraph = self.convert_markdown_to_html(second_paragraph)
 
-            # Replace {Image} placeholder with actual image HTML or size box (same wrapper for visible box)
-            if has_image_placeholder:
-                if decorative_image_file:
-                    image_html = f'''
-                <div style="{image_wrapper_style}">
-                <img src="cid:decorative_image" alt="Image" style="{img_style}">
-                </div>'''
-                else:
-                    image_html = f'''
-                <div style="margin: 16px 0; max-width: {decorative_image_size}; width: 100%; min-height: 180px; background: #f5f5f5; border: 2px dashed #bdbdbd; border-radius: 4px; display: flex; align-items: center; justify-content: center; color: #757575; font-size: 13px; box-sizing: border-box;">
-                Image ({decorative_image_size})
-                </div>''' if show_image_placeholder else ''
-                if image_html:
-                    first_paragraph = first_paragraph.replace('{Image}', image_html)
-                    second_paragraph = second_paragraph.replace('{Image}', image_html)
+            # Substitute {Image} / {Image2} placeholders where the user typed them.
+            if has_img1_placeholder and img1_html:
+                first_paragraph = first_paragraph.replace('{Image}', img1_html)
+                second_paragraph = second_paragraph.replace('{Image}', img1_html)
+            if has_img2_placeholder and img2_html:
+                first_paragraph = first_paragraph.replace('{Image2}', img2_html)
+                second_paragraph = second_paragraph.replace('{Image2}', img2_html)
 
             # Apply Gmail-style HTML template with unified content
             personalized = self.html_template.format(
@@ -776,10 +882,17 @@ class EmailAutomation:
 
     def personalize_email_with_ai(self, contact_data: Dict[str, str], email_content: str, use_html: bool = False,
                                  logo_file=None, decorative_image_file=None, attachment_files=None, email_subject: str = "",
-                                 decorative_image_size: str = "100%", show_image_placeholder: bool = False) -> Tuple[str, str]:
+                                 decorative_image_size: str = "100%", show_image_placeholder: bool = False,
+                                 decorative_image_file_2=None, decorative_image_size_2: str = "100%") -> Tuple[str, str]:
         """AI personalization removed - using simple personalization instead"""
-        return self.personalize_email(contact_data, email_content, use_html, logo_file, decorative_image_file, attachment_files, email_subject,
-                                      decorative_image_size=decorative_image_size, show_image_placeholder=show_image_placeholder)
+        return self.personalize_email(
+            contact_data, email_content, use_html, logo_file, decorative_image_file,
+            attachment_files, email_subject,
+            decorative_image_size=decorative_image_size,
+            show_image_placeholder=show_image_placeholder,
+            decorative_image_file_2=decorative_image_file_2,
+            decorative_image_size_2=decorative_image_size_2,
+        )
 
     def verify_email_content(self, email_content: str) -> Tuple[bool, List[str]]:
         """SUPER SIMPLE verification - only check for curly brace placeholders"""
@@ -819,16 +932,29 @@ def _users_file_path() -> Path:
     return Path(__file__).resolve().parent / "users.json"
 
 
+def _load_users_from_secrets() -> List[Dict[str, str]]:
+    """Load senders from st.secrets['users'] (.streamlit/secrets.toml). Returns [] if missing."""
+    try:
+        secrets_users = st.secrets["users"]
+    except (KeyError, AttributeError, FileNotFoundError, Exception):
+        return []
+    out = []
+    try:
+        for _key, val in dict(secrets_users).items():
+            name = str(val.get("name", "")).strip() if hasattr(val, "get") else ""
+            email = str(val.get("email", "")).strip() if hasattr(val, "get") else ""
+            password = str(val.get("password", "")).strip() if hasattr(val, "get") else ""
+            if name and email:
+                out.append({"name": name, "email": email, "password": password})
+    except Exception:
+        return []
+    return out
+
+
 def _load_users() -> List[Dict[str, str]]:
-    """Load user list: base users plus any from users.json (no duplicates by email)."""
-    base = [
-        {"name": "Salomé Cremona", "email": "salome.cremona@merciraymond.fr", "password": "kosj dkza wuku hlbo"},
-        {"name": "Taddeo Carpinelli", "email": "taddeo.carpinelli@merciraymond.fr", "password": "tdcg uymo tswu urvk"},
-        {"name": "Guillaume H.", "email": "guillaume@merciraymond.fr", "password": "ahlv pstg ibnv elsm"},
-        {"name": "Clémence Joly", "email": "clemence@merciraymond.fr", "password": "clef gwtu cbrm vsry"},
-        {"name": "Hugo Meunier", "email": "hugo@merciraymond.fr", "password": "rayq gdyj vaec jmrb"},
-        {"name": "Diane", "email": "dianedemagnitot@merciraymond.fr", "password": "berm pegj onet cplw"}
-    ]
+    """Load senders: from st.secrets first, then users.json (no duplicates by email).
+    Returns [] if neither source is configured — the caller surfaces a friendly warning."""
+    base = _load_users_from_secrets()
     path = _users_file_path()
     if not path.exists():
         return base
@@ -854,6 +980,374 @@ def _load_users() -> List[Dict[str, str]]:
         seen.add(email.lower())
         out.append({"name": name, "email": email, "password": password})
     return out
+
+
+# --- Suppression list (F3) -------------------------------------------------
+# Persistent list of addresses we must never email again (manual unsubscribes,
+# bounces, etc.). Source of truth: a Notion database whose ID is plugged in
+# via SUPPRESSION_NOTION_DS_ID (secrets.toml). The local filesystem is
+# ephemeral on Streamlit Cloud, so no local JSON persistence — we use a small
+# in-memory cache instead (TTL 5 min) to keep is_suppressed() fast across the
+# send loops without hammering Notion.
+#
+# Expected Notion schema:
+#   - Title property  → the email (auto-detected by type=title)
+#   - "Date"          → date type (created when added by the app)
+#   - "Raison"        → rich_text or select (defaults to "manual_unsubscribe")
+
+_SUPPRESSION_CACHE_TTL_S = 300  # 5 minutes
+_suppression_state = {
+    "data": {},              # {email_lc: {"date": iso, "reason": str}}
+    "last_fetch": 0.0,
+    "resolved_ds_id": None,  # cached after first successful resolution
+    "loaded_ever": False,
+}
+
+
+def _resolve_suppression_ds_id() -> Optional[str]:
+    """Return a working data source ID for the suppression DB.
+    Accepts either a data source ID or a database ID in SUPPRESSION_NOTION_DS_ID
+    and figures out which one it is. Result is cached after the first call."""
+    if not SUPPRESSION_NOTION_DS_ID or not NOTION_API_KEY:
+        return None
+    if _suppression_state["resolved_ds_id"]:
+        return _suppression_state["resolved_ds_id"]
+
+    headers_ds = {
+        "Authorization": f"Bearer {NOTION_API_KEY}",
+        "Notion-Version": NOTION_API_VERSION_DS,
+        "Content-Type": "application/json",
+    }
+
+    # Probe 1: treat the value as a data source ID.
+    try:
+        probe = requests.post(
+            f"https://api.notion.com/v1/data_sources/{SUPPRESSION_NOTION_DS_ID}/query",
+            headers=headers_ds, json={"page_size": 1}, timeout=10,
+        )
+        if probe.status_code < 400:
+            _suppression_state["resolved_ds_id"] = SUPPRESSION_NOTION_DS_ID
+            return SUPPRESSION_NOTION_DS_ID
+    except requests.RequestException:
+        pass
+
+    # Probe 2: treat the value as a database ID and discover its data source.
+    try:
+        meta = requests.get(
+            f"https://api.notion.com/v1/databases/{SUPPRESSION_NOTION_DS_ID}",
+            headers=headers_ds, timeout=10,
+        )
+        meta.raise_for_status()
+        data_sources = meta.json().get("data_sources", [])
+        if data_sources:
+            ds_id = data_sources[0].get("id")
+            if ds_id:
+                _suppression_state["resolved_ds_id"] = ds_id
+                return ds_id
+    except requests.RequestException:
+        pass
+
+    return None
+
+
+def _fetch_suppression_from_notion() -> dict:
+    """Query Notion for the full suppression list. Returns {email_lc: meta}.
+    Raises on network / auth / schema errors so the caller can fall back to
+    the last known good cache."""
+    ds_id = _resolve_suppression_ds_id()
+    if not ds_id:
+        raise RuntimeError("SUPPRESSION_NOTION_DS_ID not configured or unreachable")
+
+    headers = {
+        "Authorization": f"Bearer {NOTION_API_KEY}",
+        "Notion-Version": NOTION_API_VERSION_DS,
+        "Content-Type": "application/json",
+    }
+    url = f"https://api.notion.com/v1/data_sources/{ds_id}/query"
+
+    out = {}
+    start_cursor = None
+    while True:
+        body = {"page_size": 100}
+        if start_cursor:
+            body["start_cursor"] = start_cursor
+        resp = requests.post(url, headers=headers, json=body, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+        for page in payload.get("results", []):
+            props = page.get("properties", {})
+            email_lc = None
+            # The email lives in the title property (whatever its name).
+            for _name, pdata in props.items():
+                if pdata.get("type") == "title":
+                    title_items = pdata.get("title", [])
+                    if title_items:
+                        email_lc = "".join(
+                            it.get("plain_text", "") for it in title_items
+                        ).strip().lower()
+                    break
+            if not email_lc:
+                continue
+            # Optional Date property.
+            date_val = ""
+            date_prop = props.get("Date") or {}
+            if date_prop.get("type") == "date":
+                date_val = (date_prop.get("date") or {}).get("start") or ""
+            # Optional Raison property (rich_text or select).
+            reason_val = "manual_unsubscribe"
+            for reason_key in ("Raison", "Reason"):
+                pdata = props.get(reason_key) or {}
+                if pdata.get("type") == "rich_text":
+                    items = pdata.get("rich_text", [])
+                    if items:
+                        reason_val = "".join(
+                            it.get("plain_text", "") for it in items
+                        ).strip() or reason_val
+                    break
+                if pdata.get("type") == "select":
+                    sel = pdata.get("select") or {}
+                    if sel.get("name"):
+                        reason_val = sel["name"]
+                    break
+            out[email_lc] = {"date": date_val, "reason": reason_val}
+        if payload.get("has_more"):
+            start_cursor = payload.get("next_cursor")
+        else:
+            break
+    return out
+
+
+def _post_suppression_to_notion(email_lc: str, reason: str) -> bool:
+    """Create a new page in the suppression DB. Returns True on success."""
+    ds_id = _resolve_suppression_ds_id()
+    if not ds_id:
+        return False
+    headers = {
+        "Authorization": f"Bearer {NOTION_API_KEY}",
+        "Notion-Version": NOTION_API_VERSION_DS,
+        "Content-Type": "application/json",
+    }
+    body = {
+        "parent": {"type": "data_source_id", "data_source_id": ds_id},
+        "properties": {
+            # Title property: Notion accepts any name; we use "Email" as the convention.
+            "Email": {"title": [{"text": {"content": email_lc}}]},
+            "Date":  {"date": {"start": datetime.now().date().isoformat()}},
+            "Raison": {"rich_text": [{"text": {"content": reason}}]},
+        },
+    }
+    try:
+        resp = requests.post(
+            "https://api.notion.com/v1/pages",
+            headers=headers, json=body, timeout=15,
+        )
+        if resp.status_code >= 400:
+            # Fallback: legacy database parent + legacy API version.
+            body["parent"] = {"type": "database_id", "database_id": SUPPRESSION_NOTION_DS_ID}
+            legacy_headers = dict(headers)
+            legacy_headers["Notion-Version"] = NOTION_API_VERSION_LEGACY
+            resp = requests.post(
+                "https://api.notion.com/v1/pages",
+                headers=legacy_headers, json=body, timeout=15,
+            )
+        resp.raise_for_status()
+        return True
+    except requests.RequestException as e:
+        try:
+            st.error(f"⚠️ Échec d'ajout dans Notion: {e}")
+        except Exception:
+            pass
+        return False
+
+
+def _load_suppression() -> dict:
+    """Return the suppression dict. Re-fetches from Notion when the in-memory
+    cache is stale. On Notion failure, returns the last known good copy."""
+    import time as _time
+    now = _time.time()
+    fresh_enough = (
+        _suppression_state["loaded_ever"]
+        and (now - _suppression_state["last_fetch"]) < _SUPPRESSION_CACHE_TTL_S
+    )
+    if fresh_enough:
+        return _suppression_state["data"]
+    if not SUPPRESSION_NOTION_DS_ID:
+        # Not configured yet — return empty so the app keeps working.
+        return {}
+    try:
+        fresh = _fetch_suppression_from_notion()
+        _suppression_state["data"] = fresh
+        _suppression_state["last_fetch"] = now
+        _suppression_state["loaded_ever"] = True
+        return fresh
+    except Exception:
+        # Stale-while-error: keep serving the last known good copy if any.
+        return _suppression_state["data"]
+
+
+def is_suppressed(email: str) -> bool:
+    if not email or not isinstance(email, str):
+        return False
+    return email.strip().lower() in _load_suppression()
+
+
+def add_suppression(email: str, reason: str = "manual_unsubscribe") -> bool:
+    """Push one address to the Notion suppression DB. Returns True on success."""
+    if not SUPPRESSION_NOTION_DS_ID:
+        try:
+            st.error("⚠️ SUPPRESSION_NOTION_DS_ID non configuré dans secrets.toml — impossible d'ajouter à la liste.")
+        except Exception:
+            pass
+        return False
+    if not email or not email.strip():
+        return False
+    email_lc = email.strip().lower()
+    ok = _post_suppression_to_notion(email_lc, reason)
+    if ok:
+        # Update local cache immediately and force the next read to refresh.
+        _suppression_state["data"][email_lc] = {
+            "date": datetime.now().date().isoformat(),
+            "reason": reason,
+        }
+        _suppression_state["last_fetch"] = 0.0  # invalidate TTL
+    return ok
+
+
+def parse_email_list(raw: str) -> List[str]:
+    """Extract individual email addresses from a free-form text blob
+    (newlines / commas / semicolons / spaces). Lowercased + deduped."""
+    if not raw:
+        return []
+    pattern = r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
+    found = re.findall(pattern, raw)
+    seen = []
+    seen_set = set()
+    for e in found:
+        low = e.strip().lower()
+        if low and low not in seen_set:
+            seen_set.add(low)
+            seen.append(low)
+    return seen
+
+
+# --- Unsubscribe footer guard (F2) -----------------------------------------
+# The template already injects the footer. This guard makes sure manually
+# edited emails (text_area in the "invalid" review flow) also carry it.
+
+def _ensure_unsubscribe_footer(html: str) -> str:
+    """Append the unsubscribe footer if the marker is absent."""
+    if not html:
+        return UNSUBSCRIBE_FOOTER_HTML
+    if UNSUBSCRIBE_FOOTER_MARKER in html:
+        return html
+    return html + "\n" + UNSUBSCRIBE_FOOTER_HTML
+
+
+# --- Unified email send (refactor §6) --------------------------------------
+# Single source of truth used by both send loops. Adds List-Unsubscribe /
+# List-Unsubscribe-Post / Reply-To headers (F1), guarantees the footer (F2),
+# and handles inline images + attachments.
+
+def _build_email_message(
+    sender_email: str,
+    email_data: dict,
+    cc_emails: str,
+    decorative_image_file,
+    attachment_files,
+    automation,
+    decorative_image_file_2=None,
+):
+    """Build the MIMEMultipart('mixed') root with all headers and parts."""
+    msg_root = MIMEMultipart('mixed')
+    msg_root['From'] = sender_email
+    msg_root['To'] = email_data['email']
+    msg_root['Subject'] = email_data.get(
+        'personalized_subject', 'MERCI RAYMOND - Votre service paysagiste'
+    )
+
+    if cc_emails and cc_emails.strip():
+        msg_root['Cc'] = cc_emails.strip()
+
+    # F1 — Deliverability headers (RFC 8058 + RFC 2369).
+    # mailto: only for now; an HTTPS one-click endpoint can be added later.
+    msg_root['List-Unsubscribe'] = (
+        f'<mailto:{UNSUBSCRIBE_MAILTO}?subject=unsubscribe%20{email_data["email"]}>'
+    )
+    msg_root['List-Unsubscribe-Post'] = 'List-Unsubscribe=One-Click'
+    msg_root['Reply-To'] = sender_email
+
+    # F2 — Make sure the footer is always there, even on hand-edited HTML.
+    html_body = _ensure_unsubscribe_footer(email_data['personalized_email'])
+
+    alt = MIMEMultipart('alternative')
+    msg_root.attach(alt)
+
+    plain_text = html2text.html2text(html_body)
+    alt.attach(MIMEText(plain_text, 'plain', 'utf-8'))
+
+    rel = MIMEMultipart('related')
+    rel.attach(MIMEText(html_body, 'html', 'utf-8'))
+    alt.attach(rel)
+
+    # Inline decorative images. Each gets a distinct Content-ID matching the
+    # cid: references emitted by personalize_email (decorative_image / decorative_image_2).
+    for img_file, cid, fname in (
+        (decorative_image_file,   'decorative_image',   'decorative_image.jpg'),
+        (decorative_image_file_2, 'decorative_image_2', 'decorative_image_2.jpg'),
+    ):
+        if not img_file:
+            continue
+        try:
+            compressed = automation.compress_image(img_file)
+            mime_img = MIMEImage(compressed.getvalue())
+            mime_img.add_header('Content-ID', f'<{cid}>')
+            mime_img.add_header('Content-Disposition', 'inline', filename=fname)
+            rel.attach(mime_img)
+        except Exception as e:
+            st.warning(f"⚠️ Impossible d'ajouter l'image décorative ({cid}): {e}")
+
+    if attachment_files:
+        for attachment_file in attachment_files:
+            try:
+                if attachment_file.type.startswith('image/'):
+                    attachment = MIMEImage(attachment_file.getvalue())
+                else:
+                    attachment = MIMEApplication(attachment_file.getvalue())
+                attachment.add_header(
+                    'Content-Disposition',
+                    'attachment',
+                    filename=attachment_file.name,
+                )
+                msg_root.attach(attachment)
+            except Exception as e:
+                st.warning(f"⚠️ Impossible de joindre {attachment_file.name}: {e}")
+
+    return msg_root
+
+
+def send_one_email(
+    server,
+    sender_email: str,
+    email_data: dict,
+    cc_emails: str,
+    automation,
+    decorative_image_file=None,
+    attachment_files=None,
+    decorative_image_file_2=None,
+) -> None:
+    """Send one email over an open SMTP server. Raises on failure so the
+    caller can count failures and keep going. Does NOT enforce sleep,
+    suppression, or daily cap — those are the caller's responsibility."""
+    msg_root = _build_email_message(
+        sender_email, email_data, cc_emails,
+        decorative_image_file, attachment_files, automation,
+        decorative_image_file_2=decorative_image_file_2,
+    )
+    text = msg_root.as_string()
+    recipients = [email_data['email']]
+    if cc_emails and cc_emails.strip():
+        recipients.extend([e.strip() for e in cc_emails.split(',') if e.strip()])
+    server.sendmail(sender_email, recipients, text)
 
 
 def _append_user_to_file(name: str, email: str, password: str) -> Optional[str]:
@@ -1008,9 +1502,60 @@ def main():
             sender_email = None
             sender_password = None
     else:
-        st.sidebar.warning("Aucun utilisateur configuré")
+        st.sidebar.warning("Aucun utilisateur configuré — ajoutez un bloc `[users.X]` à `.streamlit/secrets.toml` ou utilisez le formulaire ci-dessous.")
         sender_email = None
         sender_password = None
+
+    # --- Deliverability sidebar widget (F3) -------------------------------
+    # Suppression list — source of truth is the Notion DB plugged via
+    # SUPPRESSION_NOTION_DS_ID. UI here only lets the team append addresses
+    # received in the desinscription@ mailbox. No remove path: the team rule
+    # is that suppressed = forever (Notion is editable directly if rare manual
+    # corrections are needed).
+    st.sidebar.divider()
+    st.sidebar.subheader("📬 Délivrabilité")
+    with st.sidebar.expander("🚫 Gestion des désinscriptions"):
+        if not SUPPRESSION_NOTION_DS_ID:
+            st.warning(
+                "⚠️ `SUPPRESSION_NOTION_DS_ID` non configuré dans `secrets.toml`. "
+                "La liste de désinscription est désactivée tant qu'aucun ID n'est plugué."
+            )
+        # Surface the success banner from the previous run (set by the form
+        # handler below, then we st.rerun() so the counter refreshes from Notion).
+        # pop() shows it once and clears the flag, so it doesn't stick forever.
+        _added_count = st.session_state.pop('_suppression_add_success', None)
+        if _added_count:
+            st.success(f"✅ {_added_count} adresse(s) ajoutée(s) à Notion.")
+
+        current_suppression = _load_suppression()
+        st.caption(f"{len(current_suppression)} adresse(s) dans la liste de désinscription (Notion).")
+
+        # Use a form so clear_on_submit handles the text_area reset for us —
+        # writing to st.session_state['suppression_add_input'] manually fails
+        # because the widget has already been instantiated in the same run.
+        with st.form("suppression_add_form", clear_on_submit=True):
+            new_unsubs = st.text_area(
+                "Emails à ajouter (un par ligne ou séparés par , ; espace)",
+                key="suppression_add_input",
+                height=100,
+                placeholder="exemple@client.fr\nautre@client.fr",
+            )
+            submitted = st.form_submit_button("➕ Ajouter")
+
+        if submitted:
+            parsed = parse_email_list(new_unsubs)
+            added = 0
+            for e in parsed:
+                if add_suppression(e, reason="manual_unsubscribe"):
+                    added += 1
+            if added:
+                # Stash the count and rerun; the banner block above re-renders
+                # the success message on the next pass with a fresh counter.
+                st.session_state['_suppression_add_success'] = added
+                st.rerun()
+            else:
+                st.warning("Aucune adresse email valide détectée (ou échec Notion — vérifier le log ci-dessus).")
+    # ----------------------------------------------------------------------
 
     # Add user from UI
     with st.sidebar.expander("➕ Ajouter un utilisateur"):
@@ -1120,6 +1665,12 @@ def main():
                 st.info(f"{len(valid_contacts)} emails uniques (dont {duplicates_removed} doublons retires)")
             else:
                 st.info(f"{len(valid_contacts)} emails uniques")
+
+            # Show suppression filter info
+            suppressed_removed = st.session_state.get('suppressed_removed', 0)
+            if suppressed_removed > 0:
+                st.metric("Désinscrits ignorés", suppressed_removed)
+                st.info(f"🚫 {suppressed_removed} adresse(s) retirée(s) via la liste de désinscription")
 
         # Show user guidance
         if email_column and available_placeholders:
@@ -1308,7 +1859,7 @@ def main():
             "Modifiez le contenu complet de votre email (en-tête, contenu principal, signature):",
             value="",
             height=400,
-            help="Créez votre email complet ici. Utilisez des placeholders comme {contact_name}, {site}, etc. Formatage: **gras**, *italique*, - puces, {color:red}couleur{/color}.",
+            help="Créez votre email complet ici. Utilisez des placeholders comme {contact_name}, {site}, etc. Formatage: **gras**, *italique*, - puces, {color:red}couleur{/color}, [texte du lien](https://url).",
             key=f"email_content_{email_format}",  # Unique key per format
             placeholder=""
         )
@@ -1357,13 +1908,15 @@ def main():
                                 placeholder_text += f"- **{base_name}:** `{{{base_name}}}` (nom complet), `{{{placeholders['first']}}}` (prénom), `{{{placeholders['last']}}}` (nom de famille)\n"
 
                     placeholder_text += "\n**Placeholders spéciaux :**\n"
-                    placeholder_text += "- `{Image}` : Place l'image décorative à cet endroit (remplace le placement automatique)"
+                    placeholder_text += "- `{Image}` : place la 1re image décorative ici (sinon placement automatique)\n"
+                    placeholder_text += "- `{Image2}` : place la 2e image décorative ici (sinon placement automatique)"
 
                     st.markdown(placeholder_text)
                 else:
                     st.markdown("""
                     **Placeholders spéciaux :**
-                    - `{Image}` : Place l'image décorative à cet endroit (remplace le placement automatique)
+                    - `{Image}` : place la 1re image décorative ici (sinon placement automatique)
+                    - `{Image2}` : place la 2e image décorative ici (sinon placement automatique)
                     """)
             else:
                 st.markdown("""
@@ -1379,6 +1932,7 @@ def main():
 <li><code>- element</code> &rarr; liste a puces (une ligne par element)</li>
 <li><code>&nbsp;&nbsp;&nbsp;&nbsp;- sous-element</code> &rarr; sous-liste (4 espaces avant le tiret)</li>
 <li><code>{color:nom}texte{/color}</code> &rarr; texte en couleur</li>
+<li><code>[texte](https://url)</code> &rarr; <a href="#" style="color:#1a73e8; text-decoration:underline;">lien cliquable</a> (uniquement http:// ou https://)</li>
 </ul>
 </div>''', unsafe_allow_html=True)
             st.markdown('''<div style="margin-top: 0.5rem;">
@@ -1483,6 +2037,68 @@ def main():
         st.session_state.decorative_image_size = decorative_image_size_label
         decorative_image_size_css = st.session_state.email_automation.decorative_image_sizes.get(decorative_image_size_label, "100%")
 
+        # --- Optional 2nd inline image (placeholder {Image2}) -------------
+        if 'saved_decorative_choice_2' not in st.session_state:
+            st.session_state.saved_decorative_choice_2 = None
+        if 'decorative_image_file_2' not in st.session_state:
+            st.session_state.decorative_image_file_2 = None
+
+        with st.expander("➕ Ajouter une 2e image (optionnel)"):
+            st.caption("Place le placeholder `{Image2}` dans ton texte pour la positionner précisément. Sinon elle s'affiche sous la première.")
+            decorative_image_file_2 = st.file_uploader(
+                "Image décorative n°2",
+                type=['png', 'jpg', 'jpeg'],
+                help="2e image inline. Enregistrée pour réutilisation comme la première.",
+                key="decorative_image_file_2_uploader",
+            )
+
+            if decorative_image_file_2:
+                saved_path_2 = _save_uploaded_file(decorative_image_file_2, DECORATIVE_SUBDIR)
+                st.session_state.decorative_image_file_2 = decorative_image_file_2
+                st.session_state.saved_decorative_choice_2 = None
+                if saved_path_2:
+                    st.success("✅ 2e image chargée et enregistrée pour plus tard.")
+                else:
+                    st.success("✅ 2e image chargée")
+            else:
+                saved_list_2 = _list_saved_files(DECORATIVE_SUBDIR)
+                options_2 = ["— Aucune —"] + [name for name, _ in saved_list_2]
+                idx_2 = 0
+                if st.session_state.saved_decorative_choice_2:
+                    for i, (name, _) in enumerate(saved_list_2):
+                        if name == st.session_state.saved_decorative_choice_2:
+                            idx_2 = i + 1
+                            break
+                chosen_2 = st.selectbox(
+                    "Ou utiliser une image enregistrée",
+                    options=options_2,
+                    index=idx_2,
+                    key="saved_decorative_select_2",
+                )
+                if chosen_2 and chosen_2 != "— Aucune —":
+                    for name, path in saved_list_2:
+                        if name == chosen_2:
+                            st.session_state.decorative_image_file_2 = _load_saved_file(path)
+                            st.session_state.saved_decorative_choice_2 = name
+                            break
+                else:
+                    st.session_state.saved_decorative_choice_2 = None
+                    st.session_state.decorative_image_file_2 = None
+
+            if 'decorative_image_size_2' not in st.session_state:
+                st.session_state.decorative_image_size_2 = size_options[default_size_index]
+            decorative_image_size_label_2 = st.selectbox(
+                "Taille de la 2e image",
+                options=size_options,
+                index=size_options.index(st.session_state.decorative_image_size_2) if st.session_state.decorative_image_size_2 in size_options else default_size_index,
+                help="Taille indépendante de l'image n°1.",
+                key="decorative_image_size_select_2",
+            )
+            st.session_state.decorative_image_size_2 = decorative_image_size_label_2
+        decorative_image_size_css_2 = st.session_state.email_automation.decorative_image_sizes.get(
+            st.session_state.get('decorative_image_size_2', size_options[default_size_index]), "100%"
+        )
+
         attachment_files = st.file_uploader(
             "Fichiers à joindre",
             type=['pdf', 'doc', 'docx', 'xls', 'xlsx', 'png', 'jpg', 'jpeg', 'txt'],
@@ -1551,17 +2167,22 @@ def main():
                 attachment_files=st.session_state.get('attachment_files', []),
                 email_subject=email_subject if email_subject else "",
                 decorative_image_size=decorative_image_size_css,
-                show_image_placeholder=True
+                show_image_placeholder=True,
+                decorative_image_file_2=st.session_state.get('decorative_image_file_2'),
+                decorative_image_size_2=decorative_image_size_css_2,
             )
-        # In preview iframe cid: doesn't work; inject image as base64 so it displays at correct size
-        _preview_img = st.session_state.get('decorative_image_file')
-        if _preview_img is not None:
+        # In preview iframe cid: doesn't work; inject image(s) as base64 so they display at correct size
+        for _ss_key, _cid in (('decorative_image_file', 'decorative_image'),
+                              ('decorative_image_file_2', 'decorative_image_2')):
+            _preview_img = st.session_state.get(_ss_key)
+            if _preview_img is None:
+                continue
             try:
                 _preview_img.seek(0)
                 _b64 = base64.b64encode(_preview_img.read()).decode('utf-8')
                 _mime = _preview_img.type if getattr(_preview_img, 'type', None) else 'image/jpeg'
                 _data_url = f"data:{_mime};base64,{_b64}"
-                sample_html = sample_html.replace('src="cid:decorative_image"', f'src="{_data_url}"')
+                sample_html = sample_html.replace(f'src="cid:{_cid}"', f'src="{_data_url}"')
             except Exception:
                 pass
         st.markdown(f'<p style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; line-height: 1.4; color: #202124; margin: 0 0 16px 0;"><strong>Objet:</strong> {sample_subject}</p>', unsafe_allow_html=True)
@@ -1588,6 +2209,7 @@ def main():
                     use_html_for_processing = True
 
                     decorative_image_file_for_processing = st.session_state.get('decorative_image_file', None)
+                    decorative_image_file_2_for_processing = st.session_state.get('decorative_image_file_2', None)
 
                     progress_bar = st.progress(0)
                     status_text = st.empty()
@@ -1603,13 +2225,18 @@ def main():
                         _img_size_css = st.session_state.email_automation.decorative_image_sizes.get(
                             st.session_state.get('decorative_image_size', 'Pleine largeur (100%)'), "100%"
                         )
+                        _img_size_css_2 = st.session_state.email_automation.decorative_image_sizes.get(
+                            st.session_state.get('decorative_image_size_2', 'Pleine largeur (100%)'), "100%"
+                        )
                         personalized, personalized_subject = st.session_state.email_automation.personalize_email(
                             contact_data, email_content_for_processing, use_html_for_processing,
                             logo_file=None, decorative_image_file=decorative_image_file_for_processing,
                             attachment_files=st.session_state.get('attachment_files', []),
                             email_subject=email_subject_for_processing,
                             decorative_image_size=_img_size_css,
-                            show_image_placeholder=False
+                            show_image_placeholder=False,
+                            decorative_image_file_2=decorative_image_file_2_for_processing,
+                            decorative_image_size_2=_img_size_css_2,
                         )
 
                         is_valid, issues = st.session_state.email_automation.verify_email_content(personalized)
@@ -1709,6 +2336,18 @@ def main():
             # Filter out already sent emails
             remaining_emails = [email for email in valid_emails if email['email'] not in sent_emails_set]
             already_sent_count = len(valid_emails) - len(remaining_emails)
+
+            # F3 — Drop suppressed addresses so the counters and "ready to send" UI
+            # reflect what will actually be sent. Test mode preserves the real
+            # recipient in 'original_email', so we check that.
+            def _suppression_target(e):
+                return e.get('original_email', e.get('email', ''))
+
+            pre_suppress_count = len(remaining_emails)
+            remaining_emails = [e for e in remaining_emails if not is_suppressed(_suppression_target(e))]
+            suppressed_in_batch = pre_suppress_count - len(remaining_emails)
+            if suppressed_in_batch > 0:
+                st.info(f"🚫 {suppressed_in_batch} destinataire(s) ignoré(s) (présents dans la liste de désinscription)")
 
             # Show status if some emails were already sent
             if already_sent_count > 0 and len(remaining_emails) > 0:
@@ -1866,6 +2505,7 @@ def main():
 
                             sent_count = 0
                             failed_count = 0
+                            skipped_suppressed_count = 0
 
                             try:
                                 # Setup SMTP
@@ -1884,84 +2524,33 @@ def main():
                                     except:
                                         pass
 
+                                decorative_image_file = st.session_state.get('decorative_image_file', None)
+                                decorative_image_file_2 = st.session_state.get('decorative_image_file_2', None)
+                                attachment_files = st.session_state.get('attachment_files', [])
+
                                 for i, email_data in enumerate(validated_emails):
+                                    # F3 — Never email a suppressed address. Test mode preserves
+                                    # the real recipient in 'original_email', so we check that.
+                                    suppression_target = email_data.get('original_email', email_data['email'])
+                                    if is_suppressed(suppression_target):
+                                        skipped_suppressed_count += 1
+                                        progress_bar_invalid.progress((i + 1) / len(validated_emails))
+                                        continue
+
                                     try:
-                                        # Get display name with fallbacks
                                         display_name = email_data.get('contact_name', email_data.get('Name', email_data.get('Full Name', 'Contact')))
                                         status_text_invalid.text(f"Envoi: {display_name} ({i+1}/{len(validated_emails)})")
 
-                                        # Create email with proper MIME structure
-                                        msg_root = MIMEMultipart('mixed')
-                                        msg_root['From'] = sender_email
-                                        msg_root['To'] = email_data['email']
-                                        msg_root['Subject'] = email_data.get('personalized_subject', 'MERCI RAYMOND - Votre service paysagiste')
-
-                                        # Add CC if specified
-                                        if cc_emails and cc_emails.strip():
-                                            msg_root['Cc'] = cc_emails.strip()
-
-                                        # Create alternative container for plain text and HTML
-                                        alt = MIMEMultipart('alternative')
-                                        msg_root.attach(alt)
-
-                                        # Generate plain text version from HTML
-                                        plain_text = html2text.html2text(email_data['personalized_email'])
-                                        alt.attach(MIMEText(plain_text, 'plain', 'utf-8'))
-
-                                        # Create related container for HTML and inline images
-                                        rel = MIMEMultipart('related')
-                                        rel.attach(MIMEText(email_data['personalized_email'], 'html', 'utf-8'))
-                                        alt.attach(rel)
-
-                                        # Add decorative image as inline attachment
-                                        decorative_image_file = st.session_state.get('decorative_image_file', None)
-                                        if decorative_image_file:
-                                            try:
-                                                # Compress decorative image before attaching
-                                                compressed_decorative = st.session_state.email_automation.compress_image(decorative_image_file)
-                                                image_attachment = MIMEImage(compressed_decorative.getvalue())
-                                                image_attachment.add_header('Content-ID', '<decorative_image>')
-                                                image_attachment.add_header('Content-Disposition', 'inline', filename='decorative_image.jpg')
-                                                rel.attach(image_attachment)
-                                            except Exception as e:
-                                                st.warning(f"⚠️ Impossible d'ajouter l'image décorative: {e}")
-
-                                        # Add regular attachments to root level
-                                        attachment_files = st.session_state.get('attachment_files', [])
-                                        if attachment_files:
-                                            for attachment_file in attachment_files:
-                                                try:
-                                                    if attachment_file.type.startswith('image/'):
-                                                        attachment = MIMEImage(attachment_file.getvalue())
-                                                    else:
-                                                        from email.mime.application import MIMEApplication
-                                                        attachment = MIMEApplication(attachment_file.getvalue())
-
-                                                    attachment.add_header(
-                                                        'Content-Disposition',
-                                                        'attachment',
-                                                        filename=attachment_file.name
-                                                    )
-                                                    msg_root.attach(attachment)
-                                                except Exception as e:
-                                                    st.warning(f"⚠️ Impossible de joindre {attachment_file.name}: {e}")
-
-                                        # Send email
-                                        text = msg_root.as_string()
-
-                                        # Prepare recipient list (TO + CC)
-                                        recipients = [email_data['email']]
-                                        if cc_emails and cc_emails.strip():
-                                            cc_list = [email.strip() for email in cc_emails.split(',') if email.strip()]
-                                            recipients.extend(cc_list)
-
-                                        server.sendmail(sender_email, recipients, text)
+                                        send_one_email(
+                                            server, sender_email, email_data, cc_emails,
+                                            st.session_state.email_automation,
+                                            decorative_image_file=decorative_image_file,
+                                            attachment_files=attachment_files,
+                                            decorative_image_file_2=decorative_image_file_2,
+                                        )
                                         sent_count += 1
 
-                                        # Track sent email
                                         current_sent_emails.add(email_data['email'])
-
-                                        # Save progress after each email
                                         progress_data = {
                                             'sent_emails': list(current_sent_emails),
                                             'last_update': datetime.now().isoformat()
@@ -1970,16 +2559,15 @@ def main():
                                             json.dump(progress_data, f, indent=2)
 
                                     except Exception as e:
-                                        # Get display name with fallbacks
                                         display_name = email_data.get('contact_name', email_data.get('Name', email_data.get('Full Name', 'Contact')))
                                         st.error(f"Erreur envoi {display_name}: {e}")
                                         failed_count += 1
 
                                     progress_bar_invalid.progress((i + 1) / len(validated_emails))
 
-                                    # Anti-spam delay - hardcoded 1 second
+                                    # F4 — Random delay (1–10s) between sends; none after the last.
                                     if i < len(validated_emails) - 1:
-                                        time.sleep(1)
+                                        time.sleep(random.uniform(MIN_DELAY_S, MAX_DELAY_S))
 
                                 server.quit()
 
@@ -2003,6 +2591,9 @@ def main():
 
                                 if failed_count > 0:
                                     st.error(f"❌ {failed_count} emails ont échoué")
+
+                                if skipped_suppressed_count > 0:
+                                    st.info(f"🚫 {skipped_suppressed_count} destinataire(s) ignoré(s) (présents dans la liste de désinscription)")
 
                                 status_text_invalid.text("✅ Envoi terminé!")
 
@@ -2039,6 +2630,7 @@ def main():
 
                         sent_count = 0
                         failed_count = 0
+                        skipped_suppressed_count = 0
 
                         try:
                             # Setup SMTP with hardcoded Gmail settings
@@ -2057,85 +2649,32 @@ def main():
                                 except:
                                     pass
 
+                            decorative_image_file = st.session_state.get('decorative_image_file', None)
+                            decorative_image_file_2 = st.session_state.get('decorative_image_file_2', None)
+                            attachment_files = st.session_state.get('attachment_files', [])
+
                             for i, email_data in enumerate(remaining_emails):
+                                # F3 — Never email a suppressed address.
+                                suppression_target = email_data.get('original_email', email_data['email'])
+                                if is_suppressed(suppression_target):
+                                    skipped_suppressed_count += 1
+                                    progress_bar.progress((i + 1) / len(remaining_emails))
+                                    continue
+
                                 try:
-                                    # Get display name with fallbacks
                                     display_name = email_data.get('contact_name', email_data.get('Name', email_data.get('Full Name', 'Contact')))
                                     status_text.text(f"Envoi: {display_name} ({i+1}/{len(remaining_emails)})")
 
-                                    # Create email with proper MIME structure
-                                    msg_root = MIMEMultipart('mixed')
-                                    msg_root['From'] = sender_email
-                                    msg_root['To'] = email_data['email']
-                                    msg_root['Subject'] = email_data.get('personalized_subject', 'MERCI RAYMOND - Votre service paysagiste')
-
-                                    # Add CC if specified
-                                    if cc_emails and cc_emails.strip():
-                                        msg_root['Cc'] = cc_emails.strip()
-
-                                    # Create alternative container for plain text and HTML
-                                    alt = MIMEMultipart('alternative')
-                                    msg_root.attach(alt)
-
-                                    # Generate plain text version from HTML
-                                    plain_text = html2text.html2text(email_data['personalized_email'])
-                                    alt.attach(MIMEText(plain_text, 'plain', 'utf-8'))
-
-                                    # Create related container for HTML and inline images
-                                    rel = MIMEMultipart('related')
-                                    rel.attach(MIMEText(email_data['personalized_email'], 'html', 'utf-8'))
-                                    alt.attach(rel)
-
-                                    # Add decorative image as inline attachment
-                                    decorative_image_file = st.session_state.get('decorative_image_file', None)
-                                    if decorative_image_file:
-                                        try:
-                                            # Compress decorative image before attaching
-                                            compressed_decorative = st.session_state.email_automation.compress_image(decorative_image_file)
-                                            image_attachment = MIMEImage(compressed_decorative.getvalue())
-                                            image_attachment.add_header('Content-ID', '<decorative_image>')
-                                            image_attachment.add_header('Content-Disposition', 'inline', filename='decorative_image.jpg')
-                                            rel.attach(image_attachment)
-                                        except Exception as e:
-                                            st.warning(f"⚠️ Impossible d'ajouter l'image décorative: {e}")
-
-                                    # Add regular attachments to root level
-                                    attachment_files = st.session_state.get('attachment_files', [])
-                                    if attachment_files:
-                                        for attachment_file in attachment_files:
-                                            try:
-                                                # Déterminer le type MIME
-                                                if attachment_file.type.startswith('image/'):
-                                                    attachment = MIMEImage(attachment_file.getvalue())
-                                                else:
-                                                    from email.mime.application import MIMEApplication
-                                                    attachment = MIMEApplication(attachment_file.getvalue())
-
-                                                attachment.add_header(
-                                                    'Content-Disposition',
-                                                    'attachment',
-                                                    filename=attachment_file.name
-                                                )
-                                                msg_root.attach(attachment)
-                                            except Exception as e:
-                                                st.warning(f"⚠️ Impossible de joindre {attachment_file.name}: {e}")
-
-                                    # Send email
-                                    text = msg_root.as_string()
-
-                                    # Prepare recipient list (TO + CC)
-                                    recipients = [email_data['email']]
-                                    if cc_emails and cc_emails.strip():
-                                        cc_list = [email.strip() for email in cc_emails.split(',') if email.strip()]
-                                        recipients.extend(cc_list)
-
-                                    server.sendmail(sender_email, recipients, text)
+                                    send_one_email(
+                                        server, sender_email, email_data, cc_emails,
+                                        st.session_state.email_automation,
+                                        decorative_image_file=decorative_image_file,
+                                        attachment_files=attachment_files,
+                                        decorative_image_file_2=decorative_image_file_2,
+                                    )
                                     sent_count += 1
 
-                                    # Track sent email
                                     current_sent_emails.add(email_data['email'])
-
-                                    # Save progress after each email
                                     progress_data = {
                                         'sent_emails': list(current_sent_emails),
                                         'last_update': datetime.now().isoformat()
@@ -2144,16 +2683,15 @@ def main():
                                         json.dump(progress_data, f, indent=2)
 
                                 except Exception as e:
-                                    # Get display name with fallbacks
                                     display_name = email_data.get('contact_name', email_data.get('Name', email_data.get('Full Name', 'Contact')))
                                     st.error(f"Erreur envoi {display_name}: {e}")
                                     failed_count += 1
 
                                 progress_bar.progress((i + 1) / len(remaining_emails))
 
-                                # Anti-spam delay - hardcoded 1 second
-                                if i < len(remaining_emails) - 1:  # Don't delay after last email
-                                    time.sleep(1)
+                                # F4 — Random delay (1–10s) between sends; none after the last.
+                                if i < len(remaining_emails) - 1:
+                                    time.sleep(random.uniform(MIN_DELAY_S, MAX_DELAY_S))
 
                             server.quit()
 
@@ -2183,6 +2721,10 @@ def main():
 
                             if failed_count > 0:
                                 st.error(f"❌ {failed_count} emails ont échoué")
+
+                            if skipped_suppressed_count > 0:
+                                st.info(f"🚫 {skipped_suppressed_count} destinataire(s) ignoré(s) (présents dans la liste de désinscription)")
+
 
                             status_text.text("✅ Envoi terminé!")
 
