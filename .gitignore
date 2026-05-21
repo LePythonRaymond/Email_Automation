@@ -10,6 +10,12 @@ users.json
 # Deliverability state — legacy local cache (no longer the source of truth;
 # kept ignored in case a developer drops a local backup file here).
 suppression_list.json
+# Legacy daily counter (feature removed; ignored in case of stray files).
+daily_send_count.json
+
+# Per-campaign progress tracker — contains recipient email addresses (RGPD).
+# Re-created automatically by the send loops; must NEVER be committed.
+email_sending_progress.json
 
 # Saved uploaded images/files (reusable in app)
 uploaded_assets/
