@@ -996,11 +996,13 @@ def _load_users() -> List[Dict[str, str]]:
 #   - "Raison"        → rich_text or select (defaults to "manual_unsubscribe")
 
 _SUPPRESSION_CACHE_TTL_S = 300  # 5 minutes
+_SUPPRESSION_ERROR_TTL_S = 60   # after a failed Notion fetch, wait this long before retrying (circuit breaker)
 _suppression_state = {
     "data": {},              # {email_lc: {"date": iso, "reason": str}}
     "last_fetch": 0.0,
     "resolved_ds_id": None,  # cached after first successful resolution
     "loaded_ever": False,
+    "last_error": 0.0,       # timestamp of last failed fetch; arms the circuit breaker
 }
 
 
@@ -1071,7 +1073,7 @@ def _fetch_suppression_from_notion() -> dict:
         body = {"page_size": 100}
         if start_cursor:
             body["start_cursor"] = start_cursor
-        resp = requests.post(url, headers=headers, json=body, timeout=30)
+        resp = requests.post(url, headers=headers, json=body, timeout=10)
         resp.raise_for_status()
         payload = resp.json()
         for page in payload.get("results", []):
@@ -1162,9 +1164,21 @@ def _post_suppression_to_notion(email_lc: str, reason: str) -> bool:
 
 def _load_suppression() -> dict:
     """Return the suppression dict. Re-fetches from Notion when the in-memory
-    cache is stale. On Notion failure, returns the last known good copy."""
+    cache is stale. On Notion failure, returns the last known good copy and
+    backs off (circuit breaker) so a broken/unreachable Notion DB can never
+    cause per-contact / per-rerun retry storms."""
     import time as _time
     now = _time.time()
+
+    # Circuit breaker: if a fetch failed recently, serve the last known good
+    # copy (or {} if we never loaded) WITHOUT touching Notion. This is what
+    # stops the per-contact / per-rerun hammering when Notion is unreachable
+    # (e.g. the DB gets un-shared from the integration -> repeated 404s).
+    if _suppression_state["last_error"] and (
+        now - _suppression_state["last_error"]
+    ) < _SUPPRESSION_ERROR_TTL_S:
+        return _suppression_state["data"]
+
     fresh_enough = (
         _suppression_state["loaded_ever"]
         and (now - _suppression_state["last_fetch"]) < _SUPPRESSION_CACHE_TTL_S
@@ -1179,9 +1193,12 @@ def _load_suppression() -> dict:
         _suppression_state["data"] = fresh
         _suppression_state["last_fetch"] = now
         _suppression_state["loaded_ever"] = True
+        _suppression_state["last_error"] = 0.0  # clear the breaker on success
         return fresh
     except Exception:
-        # Stale-while-error: keep serving the last known good copy if any.
+        # Stale-while-error: keep serving the last known good copy if any, and
+        # arm the breaker so we don't retry on every call for the next window.
+        _suppression_state["last_error"] = now
         return _suppression_state["data"]
 
 
@@ -1210,6 +1227,7 @@ def add_suppression(email: str, reason: str = "manual_unsubscribe") -> bool:
             "reason": reason,
         }
         _suppression_state["last_fetch"] = 0.0  # invalidate TTL
+        _suppression_state["last_error"] = 0.0  # Notion is reachable — clear breaker
     return ok
 
 
@@ -2186,7 +2204,7 @@ def main():
             except Exception:
                 pass
         st.markdown(f'<p style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; line-height: 1.4; color: #202124; margin: 0 0 16px 0;"><strong>Objet:</strong> {sample_subject}</p>', unsafe_allow_html=True)
-        st.components.v1.html(sample_html, height=300, scrolling=True)
+        st.iframe(sample_html, height=300)
 
         # Add "Valider" button for personalization - right after preview
         st.markdown("<br>", unsafe_allow_html=True)
@@ -2425,7 +2443,7 @@ def main():
                         # Show preview of Gmail-style HTML with checkbox
                         show_preview = st.checkbox("👁️ Afficher l'aperçu Gmail-style", key=f"preview_{email_key}")
                         if show_preview:
-                            st.components.v1.html(edited_content, height=400, scrolling=True)
+                            st.iframe(edited_content, height=400)
 
                         # Save button
                         col1, col2 = st.columns([1, 3])
