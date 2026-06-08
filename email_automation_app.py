@@ -825,6 +825,22 @@ class EmailAutomation:
                 label="Image 2",
             )
 
+            # If a typed {Image}/{Image2} token has NO uploaded image, remove the
+            # token AND the blank line it sat on, so it leaves neither literal text
+            # nor an empty gap in the email. (When an image IS uploaded, img*_html
+            # is non-empty and the token is replaced by the image further below.)
+            _img_token_stripped = False
+            if has_img1_placeholder and not img1_html:
+                personalized = personalized.replace('{Image}', '')
+                has_img1_placeholder = False
+                _img_token_stripped = True
+            if has_img2_placeholder and not img2_html:
+                personalized = personalized.replace('{Image2}', '')
+                has_img2_placeholder = False
+                _img_token_stripped = True
+            if _img_token_stripped:
+                personalized = re.sub(r'\n{3,}', '\n\n', personalized).strip()
+
             # Default auto-placement: images appear stacked between paragraphs 1 and 2
             # when their placeholder is NOT used. Each image only contributes if it
             # actually has content (uploaded file or preview placeholder).
@@ -863,10 +879,13 @@ class EmailAutomation:
             second_paragraph = self.convert_markdown_to_html(second_paragraph)
 
             # Substitute {Image} / {Image2} placeholders where the user typed them.
-            if has_img1_placeholder and img1_html:
+            # Always resolve the token: real image HTML when an image was uploaded,
+            # otherwise strip it (img*_html is '' with no upload) so neither a
+            # literal "{Image}" nor an empty box ever leaks into the email.
+            if has_img1_placeholder:
                 first_paragraph = first_paragraph.replace('{Image}', img1_html)
                 second_paragraph = second_paragraph.replace('{Image}', img1_html)
-            if has_img2_placeholder and img2_html:
+            if has_img2_placeholder:
                 first_paragraph = first_paragraph.replace('{Image2}', img2_html)
                 second_paragraph = second_paragraph.replace('{Image2}', img2_html)
 
@@ -2185,7 +2204,7 @@ def main():
                 attachment_files=st.session_state.get('attachment_files', []),
                 email_subject=email_subject if email_subject else "",
                 decorative_image_size=decorative_image_size_css,
-                show_image_placeholder=True,
+                show_image_placeholder=False,  # WYSIWYG: empty image slots take no space (match the sent email)
                 decorative_image_file_2=st.session_state.get('decorative_image_file_2'),
                 decorative_image_size_2=decorative_image_size_css_2,
             )
