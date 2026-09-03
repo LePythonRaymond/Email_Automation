@@ -12,12 +12,22 @@ import json
 from pathlib import Path
 
 import time
+import threading
+import collections
 import base64
 import random
 import html2text
 import requests
 from io import BytesIO
 from datetime import datetime, timedelta
+
+# Pure helpers, deliberately free of streamlit and of any import back
+# into this module, so an import cycle is structurally impossible and
+# both can be tested without starting a Streamlit script run.
+import notion_props
+import sync_state
+import unsubscribe_inbox
+
 
 # Page configuration
 st.set_page_config(
@@ -135,6 +145,32 @@ NOTION_DS_ID = "285d9278-02d7-808a-9395-000b04dfc654"
 SUPPRESSION_NOTION_DS_ID = _read_secret_or_env("SUPPRESSION_NOTION_DS_ID")
 NOTION_API_VERSION_LEGACY = "2022-06-28"
 NOTION_API_VERSION_DS = "2025-09-03"
+
+# --- Unsubscribe mailbox sync (F4) — configuration --------------------------
+# desinscription@merciraymond.fr is an ALIAS: it redirects into a real person's
+# mailbox, and an alias cannot be authenticated over IMAP. So UNSUB_IMAP_USER
+# names the mailbox we actually log into, and every message is filtered on
+# Delivered-To so we never look at the rest of that person's mail.
+#
+# The password is looked up in st.secrets["users"] first, by email: the
+# `password` field there is already the Gmail app password used by
+# server.login() for SMTP, and a Gmail app password works for IMAP too. So in
+# the common case (the alias points at one of the senders) the only new secret
+# needed is UNSUB_IMAP_USER. UNSUB_IMAP_PASSWORD is the fallback for a mailbox
+# that is not one of the configured senders.
+UNSUB_IMAP_USER = _read_secret_or_env("UNSUB_IMAP_USER")
+UNSUB_IMAP_PASSWORD = _read_secret_or_env("UNSUB_IMAP_PASSWORD")
+UNSUB_IMAP_HOST = _read_secret_or_env("UNSUB_IMAP_HOST") or "imap.gmail.com"
+# Override the Delivered-To filter. Left empty it is derived automatically:
+# UNSUBSCRIBE_MAILTO when we log into a different mailbox (the alias case),
+# nothing when we log into the unsubscribe mailbox itself (a dedicated box,
+# where all the mail concerns us anyway).
+UNSUB_IMAP_FILTER = _read_secret_or_env("UNSUB_IMAP_FILTER")
+# Kill switches: flip a secret to stop the feature without a redeploy.
+UNSUB_SYNC_ENABLED = (_read_secret_or_env("UNSUB_SYNC_ENABLED") or "1") != "0"
+# Reading the senders' own mailboxes: hard bounces (5.x.x, auto-suppressed) and
+# "remove me" wording in a reply body (flagged for a human, never automatic).
+UNSUB_SCAN_BOUNCES = (_read_secret_or_env("UNSUB_SCAN_BOUNCES") or "1") != "0"
 
 
 def to_name_case(s: str) -> str:
@@ -1002,52 +1038,88 @@ def _load_users() -> List[Dict[str, str]]:
 
 
 # --- Suppression list (F3) -------------------------------------------------
-# Persistent list of addresses we must never email again (manual unsubscribes,
-# bounces, etc.). Source of truth: a Notion database whose ID is plugged in
-# via SUPPRESSION_NOTION_DS_ID (secrets.toml). The local filesystem is
-# ephemeral on Streamlit Cloud, so no local JSON persistence — we use a small
-# in-memory cache instead (TTL 5 min) to keep is_suppressed() fast across the
-# send loops without hammering Notion.
+# Persistent list of addresses we must never email again. Source of truth: a
+# Notion database whose ID is plugged in via SUPPRESSION_NOTION_DS_ID
+# (secrets.toml). The local filesystem is ephemeral on Streamlit Cloud, so no
+# local JSON persistence — a small in-memory cache (TTL 5 min) keeps
+# is_suppressed() fast across the send loops without hammering Notion.
 #
-# Expected Notion schema:
-#   - Title property  → the email (auto-detected by type=title)
-#   - "Date"          → date type (created when added by the app)
-#   - "Raison"        → rich_text or select (defaults to "manual_unsubscribe")
+# The schema is DISCOVERED at runtime, never hardcoded. History: the write path
+# used to POST a "Raison" property that does not exist in the live database
+# (whose real columns are Email/title, Date/date, Nom/rich_text). Notion rejects
+# any unknown property name with HTTP 400 validation_error, so every automatic
+# write failed and the list could only be filled by typing into Notion. The
+# error was invisible because only the requests exception was shown, never the
+# response body — which names the offending property in plain text.
+#
+# Two consequences of building the payload from the live schema:
+#   * it works with the database exactly as it is today;
+#   * the day someone adds a "Raison" column, it fills itself within the 5 min
+#     TTL, with no code change and no redeploy.
+# Anything the schema cannot hold (the reason, today) goes into the page BODY
+# via notion_props.build_provenance_children(), which is validated against no
+# schema and therefore can never be refused.
 
-_SUPPRESSION_CACHE_TTL_S = 300  # 5 minutes
-_SUPPRESSION_ERROR_TTL_S = 60   # after a failed Notion fetch, wait this long before retrying (circuit breaker)
-_suppression_state = {
-    "data": {},              # {email_lc: {"date": iso, "reason": str}}
-    "last_fetch": 0.0,
-    "resolved_ds_id": None,  # cached after first successful resolution
-    "loaded_ever": False,
-    "last_error": 0.0,       # timestamp of last failed fetch; arms the circuit breaker
-}
+_SUPPRESSION_CACHE_TTL_S = 300   # 5 minutes
+_SUPPRESSION_ERROR_TTL_S = 60    # after a failed fetch, wait this long (circuit breaker)
+_SUPPRESSION_STALE_WARN_S = 900  # beyond this age, warn before sending
+_NOTION_RESOLVE_TIMEOUT_S = 5    # per probe, and there are two of them
+_NOTION_RESOLVE_FAIL_TTL_S = 120  # negative cache on data-source resolution
+
+# Held in sync_state, NOT here: Streamlit re-executes this script's whole top
+# level in a fresh namespace on every rerun (verified: three reruns, three
+# different namespaces), so a dict defined here would be recreated on every
+# click and the TTL and circuit breaker below could never hold across reruns.
+# An imported module lives in sys.modules and is created once per process.
+_suppression_state = sync_state.suppression
+
+# The cache is mutated from the IMAP worker thread and read on every rerun.
+# The GIL makes that non-corrupting, but the writes below are copy-on-write
+# under this lock, which costs nothing at 15-200 entries and removes the
+# question entirely.
+_suppression_lock = sync_state.suppression_lock
+
+
+def _notion_headers(version: Optional[str] = None) -> dict:
+    return {
+        "Authorization": f"Bearer {NOTION_API_KEY}",
+        "Notion-Version": version or NOTION_API_VERSION_DS,
+        "Content-Type": "application/json",
+    }
 
 
 def _resolve_suppression_ds_id() -> Optional[str]:
     """Return a working data source ID for the suppression DB.
+
     Accepts either a data source ID or a database ID in SUPPRESSION_NOTION_DS_ID
-    and figures out which one it is. Result is cached after the first call."""
+    and figures out which one it is.
+
+    The negative cache matters as much as the positive one: this used to record
+    successes only, so on failure BOTH probes were replayed on every call. The
+    read path's circuit breaker does not cover this function, and the sidebar
+    paste loop calls it once per address — with a Notion endpoint that hangs
+    rather than 404s, pasting 20 addresses meant 20 x 2 x 10 s of frozen rerun.
+    """
     if not SUPPRESSION_NOTION_DS_ID or not NOTION_API_KEY:
         return None
     if _suppression_state["resolved_ds_id"]:
         return _suppression_state["resolved_ds_id"]
+    failed_at = _suppression_state["resolve_failed_at"]
+    if failed_at and (time.time() - failed_at) < _NOTION_RESOLVE_FAIL_TTL_S:
+        return None
 
-    headers_ds = {
-        "Authorization": f"Bearer {NOTION_API_KEY}",
-        "Notion-Version": NOTION_API_VERSION_DS,
-        "Content-Type": "application/json",
-    }
+    headers_ds = _notion_headers()
 
     # Probe 1: treat the value as a data source ID.
     try:
         probe = requests.post(
             f"https://api.notion.com/v1/data_sources/{SUPPRESSION_NOTION_DS_ID}/query",
-            headers=headers_ds, json={"page_size": 1}, timeout=10,
+            headers=headers_ds, json={"page_size": 1},
+            timeout=_NOTION_RESOLVE_TIMEOUT_S,
         )
         if probe.status_code < 400:
             _suppression_state["resolved_ds_id"] = SUPPRESSION_NOTION_DS_ID
+            _suppression_state["resolve_failed_at"] = 0.0
             return SUPPRESSION_NOTION_DS_ID
     except requests.RequestException:
         pass
@@ -1056,7 +1128,7 @@ def _resolve_suppression_ds_id() -> Optional[str]:
     try:
         meta = requests.get(
             f"https://api.notion.com/v1/databases/{SUPPRESSION_NOTION_DS_ID}",
-            headers=headers_ds, timeout=10,
+            headers=headers_ds, timeout=_NOTION_RESOLVE_TIMEOUT_S,
         )
         meta.raise_for_status()
         data_sources = meta.json().get("data_sources", [])
@@ -1064,10 +1136,12 @@ def _resolve_suppression_ds_id() -> Optional[str]:
             ds_id = data_sources[0].get("id")
             if ds_id:
                 _suppression_state["resolved_ds_id"] = ds_id
+                _suppression_state["resolve_failed_at"] = 0.0
                 return ds_id
     except requests.RequestException:
         pass
 
+    _suppression_state["resolve_failed_at"] = time.time()
     return None
 
 
@@ -1077,16 +1151,22 @@ def _fetch_suppression_from_notion() -> dict:
     the last known good cache."""
     ds_id = _resolve_suppression_ds_id()
     if not ds_id:
-        raise RuntimeError("SUPPRESSION_NOTION_DS_ID not configured or unreachable")
+        # This message is the first thing the operator reads during an outage,
+        # and it goes straight into the blocking banner, so it names the actual
+        # cause rather than saying "not configured" about a secret that is set.
+        # The June 2026 incident was exactly this: a correct ID on a database
+        # that had been un-shared from the integration.
+        raise RuntimeError(
+            "base de désinscription injoignable — vérifiez que la base est "
+            "toujours partagée avec l'intégration Notion (Notion → base → ••• "
+            "→ Connexions) et que SUPPRESSION_NOTION_DS_ID est correct"
+        )
 
-    headers = {
-        "Authorization": f"Bearer {NOTION_API_KEY}",
-        "Notion-Version": NOTION_API_VERSION_DS,
-        "Content-Type": "application/json",
-    }
+    headers = _notion_headers()
     url = f"https://api.notion.com/v1/data_sources/{ds_id}/query"
 
     out = {}
+    schema = None
     start_cursor = None
     while True:
         body = {"page_size": 100}
@@ -1095,7 +1175,14 @@ def _fetch_suppression_from_notion() -> dict:
         resp = requests.post(url, headers=headers, json=body, timeout=10)
         resp.raise_for_status()
         payload = resp.json()
-        for page in payload.get("results", []):
+        results = payload.get("results", [])
+        # A Notion PAGE carries every property of its database, empty ones
+        # included, so the full schema comes for free with the rows we were
+        # fetching anyway — no extra request on the hot path. Re-derived on
+        # every refresh, so a column added in Notion is picked up within the TTL.
+        if results and schema is None:
+            schema = notion_props.schema_from_page(results[0])
+        for page in results:
             props = page.get("properties", {})
             email_lc = None
             # The email lives in the title property (whatever its name).
@@ -1135,59 +1222,149 @@ def _fetch_suppression_from_notion() -> dict:
             start_cursor = payload.get("next_cursor")
         else:
             break
+    if schema:
+        _suppression_state["schema"] = schema
+        _suppression_state["schema_at"] = time.time()
     return out
 
 
-def _post_suppression_to_notion(email_lc: str, reason: str) -> bool:
-    """Create a new page in the suppression DB. Returns True on success."""
+def _suppression_schema() -> dict:
+    """{property_name: property_type} for the suppression database.
+
+    Normally free: derived from the rows _load_suppression() already fetched.
+    The explicit GET is only needed when the database is empty — no rows means
+    no page, means no schema to read off one.
+    """
+    if _suppression_state["schema"]:
+        return _suppression_state["schema"]
+    _load_suppression()
+    if _suppression_state["schema"]:
+        return _suppression_state["schema"]
     ds_id = _resolve_suppression_ds_id()
     if not ds_id:
+        return {}
+    try:
+        resp = requests.get(
+            f"https://api.notion.com/v1/data_sources/{ds_id}",
+            headers=_notion_headers(), timeout=10,
+        )
+        resp.raise_for_status()
+        _suppression_state["schema"] = notion_props.schema_from_data_source(resp.json())
+        _suppression_state["schema_at"] = time.time()
+    except requests.RequestException:
+        pass
+    return _suppression_state["schema"] or {}
+
+
+def _post_suppression_to_notion(
+    email_lc: str,
+    reason: str,
+    nom: str = "",
+    provenance: Optional[List[str]] = None,
+    _retry: bool = True,
+) -> bool:
+    """Create a page in the suppression DB. Returns True on success.
+
+    No st.* calls in here: this runs from the IMAP worker thread, which has no
+    Streamlit script context. Failures are recorded in
+    _suppression_state["last_write_error"] — INCLUDING Notion's response body,
+    which is the part that was missing and that made the "Raison" bug invisible.
+    """
+    ds_id = _resolve_suppression_ds_id()
+    if not ds_id:
+        _suppression_state["last_write_error"] = (
+            "data source Notion non résolu (secret absent, ou base non partagée "
+            "avec l'intégration)"
+        )
         return False
-    headers = {
-        "Authorization": f"Bearer {NOTION_API_KEY}",
-        "Notion-Version": NOTION_API_VERSION_DS,
-        "Content-Type": "application/json",
-    }
+
+    schema = _suppression_schema()
+    try:
+        props = notion_props.build_suppression_properties(
+            schema, email_lc, reason=reason,
+            day=datetime.now().date().isoformat(), nom=nom,
+        )
+    except notion_props.NotionSchemaError:
+        # Last resort: the title alone, under the historical name. Better a
+        # bare row than a lost unsubscribe request.
+        props = {"Email": {"title": [{"text": {"content": email_lc}}]}}
+
     body = {
         "parent": {"type": "data_source_id", "data_source_id": ds_id},
-        "properties": {
-            # Title property: Notion accepts any name; we use "Email" as the convention.
-            "Email": {"title": [{"text": {"content": email_lc}}]},
-            "Date":  {"date": {"start": datetime.now().date().isoformat()}},
-            "Raison": {"rich_text": [{"text": {"content": reason}}]},
-        },
+        "properties": props,
     }
+    if provenance:
+        body["children"] = notion_props.build_provenance_children(provenance)
+
     try:
         resp = requests.post(
             "https://api.notion.com/v1/pages",
-            headers=headers, json=body, timeout=15,
+            headers=_notion_headers(), json=body, timeout=15,
         )
-        if resp.status_code >= 400:
-            # Fallback: legacy database parent + legacy API version.
-            body["parent"] = {"type": "database_id", "database_id": SUPPRESSION_NOTION_DS_ID}
-            legacy_headers = dict(headers)
-            legacy_headers["Notion-Version"] = NOTION_API_VERSION_LEGACY
-            resp = requests.post(
-                "https://api.notion.com/v1/pages",
-                headers=legacy_headers, json=body, timeout=15,
-            )
-        resp.raise_for_status()
-        return True
-    except requests.RequestException as e:
-        try:
-            st.error(f"⚠️ Échec d'ajout dans Notion: {e}")
-        except Exception:
-            pass
+    except requests.RequestException as exc:
+        _suppression_state["last_write_error"] = f"réseau: {exc}"
         return False
 
+    if resp.status_code == 429 and _retry:
+        try:
+            time.sleep(min(5.0, float(resp.headers.get("Retry-After", 1)) + 0.2))
+        except (TypeError, ValueError):
+            time.sleep(1.2)
+        return _post_suppression_to_notion(email_lc, reason, nom, provenance,
+                                           _retry=False)
 
-def _load_suppression() -> dict:
+    if resp.status_code >= 400:
+        try:
+            code = (resp.json() or {}).get("code", "")
+        except ValueError:
+            code = ""
+        _suppression_state["last_write_error"] = (
+            f"HTTP {resp.status_code} {code} — {resp.text[:300]}"
+        )
+        if code == "validation_error" and _retry:
+            # The cached schema is stale (a column was renamed or removed):
+            # drop it, re-read it, retry once.
+            _suppression_state["schema"] = None
+            return _post_suppression_to_notion(email_lc, reason, nom, provenance,
+                                               _retry=False)
+        if code in ("object_not_found", "invalid_request_url") and _retry:
+            # Legacy parent — with the RESOLVED ds_id, not the raw secret. The
+            # old code passed SUPPRESSION_NOTION_DS_ID here, so whenever the
+            # secret held a data source id this fallback was structurally wrong.
+            legacy = dict(body)
+            legacy["parent"] = {"type": "database_id", "database_id": ds_id}
+            legacy.pop("children", None)
+            try:
+                retry = requests.post(
+                    "https://api.notion.com/v1/pages",
+                    headers=_notion_headers(NOTION_API_VERSION_LEGACY),
+                    json=legacy, timeout=15,
+                )
+            except requests.RequestException as exc:
+                _suppression_state["last_write_error"] = f"legacy réseau: {exc}"
+                return False
+            if retry.status_code < 400:
+                _suppression_state["last_write_error"] = ""
+                return True
+            _suppression_state["last_write_error"] = (
+                f"legacy HTTP {retry.status_code} — {retry.text[:300]}"
+            )
+        return False
+
+    _suppression_state["last_write_error"] = ""
+    return True
+
+
+def _load_suppression(now: Optional[float] = None) -> dict:
     """Return the suppression dict. Re-fetches from Notion when the in-memory
     cache is stale. On Notion failure, returns the last known good copy and
     backs off (circuit breaker) so a broken/unreachable Notion DB can never
-    cause per-contact / per-rerun retry storms."""
-    import time as _time
-    now = _time.time()
+    cause per-contact / per-rerun retry storms.
+
+    `now` is injectable (seconds, time.time() scale) purely so the three states
+    below are testable without patching the clock.
+    """
+    now = time.time() if now is None else now
 
     # Circuit breaker: if a fetch failed recently, serve the last known good
     # copy (or {} if we never loaded) WITHOUT touching Notion. This is what
@@ -1205,19 +1382,25 @@ def _load_suppression() -> dict:
     if fresh_enough:
         return _suppression_state["data"]
     if not SUPPRESSION_NOTION_DS_ID:
-        # Not configured yet — return empty so the app keeps working.
+        # Not configured yet — return empty so the app keeps working. The gate
+        # below is what makes sure nobody sends blind because of it.
         return {}
     try:
         fresh = _fetch_suppression_from_notion()
-        _suppression_state["data"] = fresh
+        with _suppression_lock:
+            _suppression_state["data"] = fresh
         _suppression_state["last_fetch"] = now
         _suppression_state["loaded_ever"] = True
-        _suppression_state["last_error"] = 0.0  # clear the breaker on success
+        _suppression_state["last_error"] = 0.0   # clear the breaker on success
+        _suppression_state["last_error_msg"] = ""
         return fresh
-    except Exception:
+    except Exception as exc:
         # Stale-while-error: keep serving the last known good copy if any, and
         # arm the breaker so we don't retry on every call for the next window.
+        # The message is kept because a silent degradation is what let the
+        # June 2026 outage look like a legitimately empty list.
         _suppression_state["last_error"] = now
+        _suppression_state["last_error_msg"] = f"{exc.__class__.__name__}: {exc}"[:300]
         return _suppression_state["data"]
 
 
@@ -1227,27 +1410,763 @@ def is_suppressed(email: str) -> bool:
     return email.strip().lower() in _load_suppression()
 
 
-def add_suppression(email: str, reason: str = "manual_unsubscribe") -> bool:
-    """Push one address to the Notion suppression DB. Returns True on success."""
+def _remember_suppression(email_lc: str, reason: str) -> None:
+    """Copy-on-write cache insert, so a rerun iterating the dict never sees it
+    mutate underneath."""
+    with _suppression_lock:
+        fresh = dict(_suppression_state["data"])
+        fresh[email_lc] = {
+            "date": datetime.now().date().isoformat(),
+            "reason": reason,
+        }
+        _suppression_state["data"] = fresh
+
+
+def add_suppression(
+    email: str,
+    reason: str = "manual_unsubscribe",
+    nom: str = "",
+    provenance: Optional[List[str]] = None,
+) -> bool:
+    """Push one address to the Notion suppression DB. Returns True on success.
+
+    Returns True for an address already on the list without writing anything:
+    this guard is THE idempotency mechanism of the automatic sync, and it also
+    stops the manual paste from creating a second Notion page for an address
+    that is already there.
+    """
     if not SUPPRESSION_NOTION_DS_ID:
-        try:
-            st.error("⚠️ SUPPRESSION_NOTION_DS_ID non configuré dans secrets.toml — impossible d'ajouter à la liste.")
-        except Exception:
-            pass
+        _suppression_state["last_write_error"] = (
+            "SUPPRESSION_NOTION_DS_ID non configuré dans secrets.toml"
+        )
         return False
     if not email or not email.strip():
         return False
     email_lc = email.strip().lower()
-    ok = _post_suppression_to_notion(email_lc, reason)
+    if email_lc in _load_suppression():
+        return True
+    ok = _post_suppression_to_notion(email_lc, reason, nom=nom,
+                                     provenance=provenance)
     if ok:
-        # Update local cache immediately and force the next read to refresh.
-        _suppression_state["data"][email_lc] = {
-            "date": datetime.now().date().isoformat(),
-            "reason": reason,
-        }
-        _suppression_state["last_fetch"] = 0.0  # invalidate TTL
-        _suppression_state["last_error"] = 0.0  # Notion is reachable — clear breaker
+        # Update the local cache. We deliberately do NOT reset last_fetch: the
+        # cache is already correct, and forcing a refetch meant 20 additions
+        # cost 20 POSTs plus 20 full paginated reads — which the IMAP sync,
+        # adding several addresses at once, would turn into the bottleneck.
+        _remember_suppression(email_lc, reason)
+        _suppression_state["last_error"] = 0.0   # Notion answered: clear breaker
     return ok
+
+
+def _suppression_gate(state: dict, now: Optional[float] = None,
+                      configured: Optional[bool] = None) -> Tuple[str, str]:
+    """("ok" | "warn" | "block", message). Pure: state, clock and the
+    "is the secret set" flag are all injected, so every branch below is
+    reachable from a test without touching secrets.toml.
+
+    The asymmetry to remember: Notion is the source of truth for filtering, so
+    a Notion outage BLOCKS sending. IMAP is an ingestion convenience, so an
+    IMAP outage only warns.
+
+    Blocking the "never loaded" case is not blocking a campaign "by mistake":
+    that state means we know nothing at all about the list, so is_suppressed()
+    returns False for everybody and the counter reads "0 adresse(s)" exactly
+    like a legitimately empty list. The block is precisely correlated with
+    ignorance.
+    """
+    now = time.time() if now is None else now
+    configured = bool(SUPPRESSION_NOTION_DS_ID) if configured is None else configured
+    if not configured:
+        return "warn", (
+            "⚠️ `SUPPRESSION_NOTION_DS_ID` n'est pas configuré : **aucun filtrage "
+            "de désinscription n'est appliqué**. Renseignez le secret, ou cochez "
+            "la case ci-dessous pour envoyer quand même."
+        )
+    if not state.get("loaded_ever"):
+        why = state.get("last_error_msg") or "cause inconnue"
+        return "block", (
+            "⛔ La liste de désinscription n'a **jamais pu être chargée** depuis "
+            f"Notion ({why}). Envoyer maintenant écrirait à des personnes qui ont "
+            "demandé le contraire. Vérifiez que la base est toujours partagée avec "
+            "l'intégration « Rapport d'entretien », puis réessayez."
+        )
+    age = now - state.get("last_fetch", 0.0)
+    if state.get("last_error"):
+        why = state.get("last_error_msg") or "cause inconnue"
+        return "warn", (
+            f"⚠️ Notion est injoignable ({why}). Filtrage effectué sur la dernière "
+            f"liste connue, vieille de {int(age // 60)} min."
+        )
+    if age > _SUPPRESSION_STALE_WARN_S:
+        return "warn", (
+            f"⚠️ La liste de désinscription date de {int(age // 60)} min. "
+            "Elle sera rafraîchie au prochain chargement."
+        )
+    return "ok", ""
+
+
+# --- Unsubscribe mailbox sync (F4) -----------------------------------------
+# Turns the desinscription@ mailbox (and the senders' own mailboxes) into
+# writes on the Notion suppression list. The parsing and the IMAP I/O live in
+# unsubscribe_inbox.py; what follows is only the wiring: when to run, how to
+# never run twice at once, and what to do with the verdicts.
+#
+# Streamlit Cloud has no scheduler, no worker and no Redis, so:
+#   * the work always runs in a DAEMON THREAD, never on the rerun path. That is
+#     the property which makes a repeat of the June 2026 grey-screen freeze
+#     structurally impossible: a rerun does Thread.start() and a dict read, and
+#     nothing else.
+#   * the module-level lock IS the cross-session lock, because every Streamlit
+#     session lives in the same Python process. It plays the exact role Redis
+#     SETNX played in the sibling project.
+#   * there is no cursor and no state file. The Notion list is the idempotency
+#     store (add_suppression returns True without writing for an address it
+#     already has), so re-scanning the same window is free.
+#
+# What "automatic" means here, honestly: the container sleeps when nobody uses
+# the app, so a scan only happens while someone has it open. An external cron
+# cannot help — an HTTP GET on the Streamlit URL serves the static shell and
+# never executes the script, which needs a websocket session. But no email can
+# be sent while nobody is using the app either (both SMTP loops sit inside
+# st.button handlers), so the invariant that actually matters is reachable:
+#
+#     no send can start without a sync attempt having just happened.
+#
+# That is what the pre-send gate enforces.
+
+_UNSUB_THROTTLE_S = 180          # minimum gap between two opportunistic cycles
+_UNSUB_CYCLE_BUDGET_S = 25.0     # wall clock for a whole cycle, all mailboxes
+_UNSUB_MAILBOX_DEADLINE_S = 20.0  # wall clock for one mailbox
+_UNSUB_PRESEND_WAIT_S = 8.0      # bounded join() before a send; overrun warns
+# 90 days, not 30. This window is only affordable because replay is free
+# (Notion is the idempotency store, so re-seeing an old request costs one SEARCH
+# and a few hundred bytes and writes nothing) and because the mailbox is quiet:
+# measured 16 messages delivered to desinscription@ over 180 days. A short
+# window silently drops any request older than itself -- and the app only runs
+# when someone opens it, so a fortnight of holidays would lose real requests.
+# Measured effect of widening it: a request from 43 days ago that had been typed
+# into Notion with a one-character typo, and was therefore not protected at all,
+# is now caught automatically.
+_UNSUB_WINDOW_DAYS_UNSUB = 90
+_UNSUB_WINDOW_DAYS_BOUNCE = 7    # bodies cost more, and a stale bounce is moot
+_UNSUB_BACKOFF_S = {
+    "auth": 3600,      # bad credentials need a human, not a retry
+    "quota": 600,      # Gmail bandwidth throttle
+    "mailbox": 3600,
+    "config": 3600,
+    "network": 300,
+    "unknown": 300,
+}
+_UNSUB_JOURNAL_MAXLEN = sync_state.UNSUB_JOURNAL_MAXLEN
+_UNSUB_REVIEW_MAXLEN = 20
+
+# Same reason as _suppression_state above: this must outlive a rerun, so it
+# lives in the imported sync_state module. Reset per rerun it would mean one
+# IMAP cycle per user click, a throttle that never throttles, a backoff that is
+# always forgotten, a review queue that vanishes, and no lock at all between
+# two concurrent sessions -- i.e. precisely the storm this design prevents.
+_unsub_state = sync_state.unsub
+_unsub_lock = sync_state.imap_lock
+
+
+def _unsub_journal(event: str, **fields) -> None:
+    """One JSON line per decision, to stdout AND to an in-memory ring.
+
+    stdout is the only persistent record we have: Streamlit Cloud captures it
+    ("Manage app" -> logs) and it survives reruns and container sleep. For an
+    irreversible action that is not optional. flush=True because a buffered
+    line is lost when the container is recycled.
+    """
+    entry = {"ts": datetime.now().isoformat(timespec="seconds"), "evt": event}
+    entry.update(fields)
+    _unsub_state["journal"].append(entry)
+    try:
+        print(json.dumps(entry, ensure_ascii=False), flush=True)
+    except Exception:
+        pass
+
+
+def _own_domains() -> frozenset:
+    """Our own domains, derived from the configured senders.
+
+    Computed rather than hardcoded so it can never drift out of sync when a
+    sender is added. It is what stops the classifier from ever suppressing one
+    of our own addresses.
+    """
+    domains = set()
+    for user in _load_users():
+        addr = (user.get("email") or "").strip().lower()
+        if "@" in addr:
+            domains.add(addr.rsplit("@", 1)[-1])
+    if "@" in UNSUBSCRIBE_MAILTO:
+        domains.add(UNSUBSCRIBE_MAILTO.rsplit("@", 1)[-1].lower())
+    return frozenset(domains)
+
+
+def _unsub_password_for(mailbox: str) -> str:
+    """The Gmail app password for a mailbox: the senders table first."""
+    target = (mailbox or "").strip().lower()
+    for user in _load_users():
+        if (user.get("email") or "").strip().lower() == target:
+            if user.get("password"):
+                return user["password"]
+    if target == (UNSUB_IMAP_USER or "").strip().lower():
+        return UNSUB_IMAP_PASSWORD
+    return ""
+
+
+def _unsub_backed_off(mailbox: str, now: float) -> bool:
+    return now < _unsub_state["backoff"].get((mailbox or "").lower(), 0.0)
+
+
+def _unsub_configs(sender_email: Optional[str] = None,
+                   now: Optional[float] = None) -> List:
+    """The mailboxes to scan in this cycle, already filtered by backoff.
+
+    Round-robin on purpose: scanning all six senders at once would put six
+    logins on one cycle. One per cycle, with a 180 s throttle, visits them all
+    in about 18 minutes and keeps a cycle at two to four seconds. The pre-send
+    path passes sender_email so it scans exactly the mailbox whose bounces
+    matter for the campaign about to start.
+    """
+    now = time.time() if now is None else now
+    if not UNSUB_SYNC_ENABLED:
+        return []
+    own = _own_domains()
+    never = frozenset({UNSUBSCRIBE_MAILTO.strip().lower()})
+    configs = []
+
+    # Role A: the mailbox behind the desinscription@ alias.
+    if UNSUB_IMAP_USER:
+        box = UNSUB_IMAP_USER.strip().lower()
+        password = _unsub_password_for(box)
+        if password and not _unsub_backed_off(box, now):
+            explicit = (UNSUB_IMAP_FILTER or "").strip().lower()
+            # An alias needs the filter; a dedicated mailbox does not, since
+            # everything in it concerns us.
+            derived = "" if box == UNSUBSCRIBE_MAILTO.strip().lower() else \
+                UNSUBSCRIBE_MAILTO.strip().lower()
+            configs.append(unsubscribe_inbox.ImapConfig(
+                user=box, password=password, host=UNSUB_IMAP_HOST,
+                role=unsubscribe_inbox.ROLE_UNSUB,
+                recipient_filter=explicit or derived,
+                since_days=_UNSUB_WINDOW_DAYS_UNSUB,
+                max_messages=60,
+                deadline_s=_UNSUB_MAILBOX_DEADLINE_S,
+                own_domains=own, never_suppress=never,
+            ))
+
+    # Role B: a sender's own mailbox. Bounces come back to the Return-Path, and
+    # Reply-To is the sender, so this is the only place either can be found.
+    if UNSUB_SCAN_BOUNCES:
+        senders = [u for u in _load_users()
+                   if u.get("email") and u.get("password")]
+        target = None
+        wanted = (sender_email or "").strip().lower()
+        if wanted:
+            target = next((u for u in senders
+                           if u["email"].strip().lower() == wanted), None)
+        elif senders:
+            # The counter is advanced by the CALLER, once per cycle. It used to
+            # be advanced here, and this function is called twice per cycle
+            # (once to test whether there is work, once by the worker), so the
+            # index moved by two: with six senders that visited indices 0, 2
+            # and 4 forever and never swept the other three mailboxes.
+            target = senders[_unsub_state["rr"] % len(senders)]
+        if target:
+            box = target["email"].strip().lower()
+            if not _unsub_backed_off(box, now):
+                for role in (unsubscribe_inbox.ROLE_BOUNCE,
+                             unsubscribe_inbox.ROLE_REPLY):
+                    configs.append(unsubscribe_inbox.ImapConfig(
+                        user=box, password=target["password"],
+                        host=UNSUB_IMAP_HOST, role=role,
+                        since_days=_UNSUB_WINDOW_DAYS_BOUNCE,
+                        max_messages=80, max_bodies=5,
+                        deadline_s=_UNSUB_MAILBOX_DEADLINE_S,
+                        own_domains=own, never_suppress=never,
+                    ))
+    return configs
+
+
+def _unsub_advance_rr() -> None:
+    """Move the round-robin on by one. Called exactly ONCE per cycle, by the
+    worker, so every sender's mailbox is eventually visited."""
+    senders = [u for u in _load_users() if u.get("email") and u.get("password")]
+    if senders:
+        _unsub_state["rr"] = (_unsub_state["rr"] + 1) % len(senders)
+
+
+def _unsub_has_work(now: Optional[float] = None) -> bool:
+    """Is there any mailbox we could scan right now? Side-effect free.
+
+    Kept separate from _unsub_configs() precisely because that one used to be
+    called for this test, and advanced the round-robin as a side effect.
+    """
+    now = time.time() if now is None else now
+    if not UNSUB_SYNC_ENABLED:
+        return False
+    if (UNSUB_IMAP_USER and _unsub_password_for(UNSUB_IMAP_USER)
+            and not _unsub_backed_off(UNSUB_IMAP_USER, now)):
+        return True
+    if not UNSUB_SCAN_BOUNCES:
+        return False
+    return any(u.get("email") and u.get("password")
+               and not _unsub_backed_off(u["email"], now)
+               for u in _load_users())
+
+
+def _apply_report(report) -> None:
+    """Push a report's verdicts to Notion. Fills report.added / .duplicates.
+
+    The duplicate check is explicit even though add_suppression() also guards,
+    because the counts are what prove idempotence to the operator: a second
+    scan of the same window must read "0 added".
+    """
+    for cand in report.suppress:
+        if cand.email in _load_suppression():
+            report.duplicates += 1
+            continue
+        ok = add_suppression(
+            cand.email, reason=cand.reason, nom=cand.display_name,
+            provenance=unsubscribe_inbox.provenance_lines(cand),
+        )
+        if ok:
+            report.added += 1
+        _unsub_journal(
+            "suppress", email=cand.email, reason=cand.reason, why=cand.why,
+            frm=cand.from_addr, subject=cand.subject[:120], uid=cand.uid,
+            mailbox=cand.mailbox, notion_ok=ok,
+            notion_error=_suppression_state["last_write_error"][:200] if not ok else "",
+        )
+    for cand in report.review:
+        _unsub_journal("review", candidate=cand.review_hint or cand.email,
+                       why=cand.why, frm=cand.from_addr,
+                       subject=cand.subject[:120], mailbox=cand.mailbox)
+    for cand in report.deferred:
+        # A 4.x.x deletes nothing. It is logged because a rising deferral rate
+        # is the earliest signal that a sender's reputation is degrading.
+        _unsub_journal("deferred", email=cand.email, status=cand.dsn_status,
+                       why=cand.why, mailbox=cand.mailbox)
+
+
+def _record_reports(reports: List) -> None:
+    """Fold a cycle's reports into the shared state."""
+    added = duplicates = examined = 0
+    last_error = last_kind = ""
+    for report in reports:
+        added += report.added
+        duplicates += report.duplicates
+        examined += report.examined
+        box = (report.mailbox or "").lower()
+        if report.ok:
+            _unsub_state["backoff"].pop(box, None)
+            _unsub_state["errors"].pop(box, None)
+        else:
+            wait = _UNSUB_BACKOFF_S.get(report.error_kind, 300)
+            _unsub_state["backoff"][box] = time.time() + wait
+            _unsub_state["errors"][box] = f"{report.error_kind}: {report.error}"
+            last_error, last_kind = report.error, report.error_kind
+            _unsub_journal("imap_error", mailbox=report.mailbox,
+                           role=report.role, kind=report.error_kind,
+                           error=report.error[:200], backoff_s=wait)
+        # Review items are replaced per mailbox+role, never accumulated: the
+        # message stays in the mailbox, so an unhandled one simply reappears on
+        # the next cycle. That gives us a "not yet dealt with" queue for free,
+        # with no durable state anywhere.
+        if report.ok:
+            key = f"{report.mailbox}|{report.role}"
+            _unsub_state["review"][key] = report.review[:_UNSUB_REVIEW_MAXLEN]
+    _unsub_state["added_last"] = added
+    _unsub_state["duplicates_last"] = duplicates
+    _unsub_state["examined_last"] = examined
+    _unsub_state["added_total"] += added
+    _unsub_state["last_error"] = last_error
+    _unsub_state["last_error_kind"] = last_kind
+    if reports and any(r.ok for r in reports):
+        _unsub_state["last_success"] = time.time()
+    _unsub_journal("cycle", mailboxes=len(reports), examined=examined,
+                   added=added, duplicates=duplicates, error=last_error[:120])
+
+
+def _unsub_worker(sender_email: Optional[str] = None) -> None:
+    """The whole cycle, off the rerun path. Holds _unsub_lock for its lifetime.
+
+    No st.* call anywhere in here: a thread has no ScriptRunContext, so a
+    st.write() would be dropped with a warning. Results land in _unsub_state
+    and show up on the next render. That is also why the Notion write path no
+    longer calls st.error().
+    """
+    try:
+        budget_end = time.monotonic() + _UNSUB_CYCLE_BUDGET_S
+        reports = []
+        if not sender_email:
+            _unsub_advance_rr()
+        for cfg in _unsub_configs(sender_email):
+            left = budget_end - time.monotonic()
+            if left < 3.0:
+                _unsub_journal("cycle_truncated", mailbox=cfg.user, role=cfg.role)
+                break
+            report = unsubscribe_inbox.scan_mailbox(
+                unsubscribe_inbox.with_deadline(cfg, left))
+            if report.ok:
+                _apply_report(report)
+            reports.append(report)
+        _record_reports(reports)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as exc:                      # noqa: BLE001
+        _unsub_state["last_error"] = f"{exc.__class__.__name__}: {exc}"[:300]
+        _unsub_state["last_error_kind"] = "unknown"
+        _unsub_journal("worker_crash", error=str(exc)[:200])
+    finally:
+        _unsub_state["running"] = False
+        try:
+            _unsub_lock.release()
+        except RuntimeError:
+            pass
+
+
+def _should_sync_now(state: dict, now: Optional[float] = None,
+                     force: bool = False) -> Tuple[bool, str]:
+    """(go, reason). Pure apart from the default clock, so it is testable.
+
+    force skips the throttle but never the per-mailbox backoff: broken
+    credentials must not inflict a 20 s timeout on every click of Send.
+    """
+    now = time.time() if now is None else now
+    if not UNSUB_SYNC_ENABLED:
+        return False, "relève désactivée (UNSUB_SYNC_ENABLED=0)"
+    if not UNSUB_IMAP_USER and not UNSUB_SCAN_BOUNCES:
+        return False, "aucune boîte configurée"
+    if state.get("running"):
+        return False, "déjà en cours"
+    if not force:
+        since = now - state.get("last_attempt", 0.0)
+        if since < _UNSUB_THROTTLE_S:
+            return False, f"trop tôt ({int(_UNSUB_THROTTLE_S - since)} s)"
+    return True, ""
+
+
+def _kick_unsub_sync(force: bool = False, wait_s: float = 0.0,
+                     sender_email: Optional[str] = None) -> dict:
+    """Start a cycle if allowed, and return immediately unless wait_s is given.
+
+    Every trigger goes through here — the manual button, the end of main(), the
+    auto-refreshing status fragment, the pre-send gate — so there is exactly one
+    code path that can talk to IMAP, and it is throttled and locked.
+    """
+    now = time.time()
+    go, reason = _should_sync_now(_unsub_state, now, force)
+    if go:
+        if not _unsub_has_work(now):
+            reason = "toutes les boîtes sont en attente (backoff) ou sans mot de passe"
+        elif _unsub_lock.acquire(blocking=False):
+            # Armed BEFORE the work: a crash still arms the throttle, so a
+            # failing cycle cannot be retried on every rerun.
+            _unsub_state["last_attempt"] = now
+            _unsub_state["running"] = True
+            thread = threading.Thread(
+                target=_unsub_worker, args=(sender_email,),
+                name="unsub-sync", daemon=True,
+            )
+            _unsub_state["thread"] = thread
+            thread.start()
+        else:
+            reason = "déjà en cours"
+
+    thread = _unsub_state.get("thread")
+    if wait_s and thread is not None and thread.is_alive():
+        thread.join(timeout=wait_s)
+    alive = bool(thread is not None and thread.is_alive())
+    return {
+        "ok": not _unsub_state["last_error_kind"],
+        "error": _unsub_state["last_error"],
+        "reason": reason,
+        "running": alive,
+        "added": _unsub_state["added_last"],
+        "duplicates": _unsub_state["duplicates_last"],
+    }
+
+
+def _unsub_pending_review() -> List:
+    """Every candidate awaiting a human, flattened across mailboxes."""
+    out = []
+    for items in _unsub_state["review"].values():
+        out.extend(items)
+    return out[:_UNSUB_REVIEW_MAXLEN]
+
+
+def _unsub_configured() -> bool:
+    if not UNSUB_SYNC_ENABLED:
+        return False
+    if UNSUB_IMAP_USER and _unsub_password_for(UNSUB_IMAP_USER):
+        return True
+    return bool(UNSUB_SCAN_BOUNCES and any(
+        u.get("email") and u.get("password") for u in _load_users()))
+
+
+def _humanize_age(seconds: Optional[float]) -> str:
+    """Rounded age, or "jamais" when the caller passes None.
+
+    A slightly NEGATIVE value is not "never", it is "just now": the clock is
+    read before the fetch it measures, so the age comes out at about -0.3 s on
+    a first render. Mapping that to "jamais" printed a failure right next to a
+    list that had just loaded perfectly. Callers signal a real "never" by
+    passing None, not by passing a huge number.
+    """
+    if seconds is None:
+        return "jamais"
+    seconds = int(max(0.0, seconds))
+    if seconds < 60:
+        return f"il y a {seconds} s"
+    if seconds < 3600:
+        return f"il y a {seconds // 60} min"
+    if seconds < 86400:
+        return f"il y a {seconds // 3600} h"
+    return f"il y a {seconds // 86400} j"
+
+
+def _force_suppression_reload() -> None:
+    """Clear every cached failure so the next read really goes to Notion."""
+    _suppression_state["last_error"] = 0.0
+    _suppression_state["last_error_msg"] = ""
+    _suppression_state["last_write_error"] = ""
+    _suppression_state["last_fetch"] = 0.0
+    _suppression_state["resolve_failed_at"] = 0.0
+    _suppression_state["resolved_ds_id"] = None
+    _suppression_state["schema"] = None
+
+
+def _render_unsub_status() -> None:
+    """The sidebar status block. Call it inside `with st.sidebar:`.
+
+    Two lines, deliberately distinct:
+      * the LIST is the truth used to filter recipients, and its failure blocks
+        sending;
+      * the SWEEP is an ingestion convenience, and its failure only warns.
+    Merging them would leave the operator unable to tell whether a send is safe.
+
+    The bare "15 adresse(s)" this replaces is precisely what let the June 2026
+    outage pass unnoticed: an unreachable Notion showed exactly the same thing
+    as a legitimately empty list.
+    """
+    now = time.time()
+    suppression = _load_suppression()
+    gate, gate_msg = _suppression_gate(_suppression_state, now)
+
+    if gate == "block":
+        # Outside any expander on purpose: the state that blocks sending must
+        # never require a click to be seen.
+        st.error(gate_msg)
+        if st.button("🔄 Réessayer la liste Notion", key="unsub_retry_notion",
+                     use_container_width=True):
+            _force_suppression_reload()
+            st.rerun()
+    elif not SUPPRESSION_NOTION_DS_ID:
+        st.warning(
+            "⚠️ Liste de désinscription **désactivée** : `SUPPRESSION_NOTION_DS_ID` "
+            "absent de `secrets.toml`. Aucun filtrage n'est appliqué."
+        )
+    else:
+        age = _humanize_age(
+            now - _suppression_state["last_fetch"]
+            if _suppression_state["last_fetch"] else None
+        )
+        st.caption(
+            f"🚫 Liste de désinscription : **{len(suppression)}** adresses · chargée {age}"
+        )
+        if gate == "warn" and gate_msg:
+            st.caption(gate_msg)
+
+    if _suppression_state["last_write_error"]:
+        # The message Notion itself returned. Its absence is what made the
+        # "Raison" bug invisible for months.
+        st.error(
+            "⚠️ Notion a refusé la dernière écriture : "
+            + _suppression_state["last_write_error"]
+        )
+
+    if not _unsub_configured():
+        st.caption(
+            "📥 Relève automatique désactivée — renseignez `UNSUB_IMAP_USER` "
+            "dans `secrets.toml` pour lire la boîte de désinscription."
+        )
+        return
+
+    if _unsub_state["running"]:
+        st.caption("📥 Relève en cours…")
+    elif _unsub_state["last_success"]:
+        st.caption(
+            "📥 Relève : %s · %d message(s) examiné(s) · **%d** ajoutée(s), %d déjà connue(s)"
+            % (_humanize_age(now - _unsub_state["last_success"]),
+               _unsub_state["examined_last"], _unsub_state["added_last"],
+               _unsub_state["duplicates_last"])
+        )
+    else:
+        st.caption("📥 Relève : jamais effectuée dans cette session.")
+
+    for mailbox, message in list(_unsub_state["errors"].items()):
+        until = _unsub_state["backoff"].get(mailbox, 0.0)
+        wait = max(0, int((until - now) // 60))
+        st.caption(f"⏳ {mailbox} : {message[:120]} — nouvelle tentative dans {wait} min")
+
+    # Kick a cycle from HERE too, not only at the end of main(). A fragment
+    # auto-rerun re-runs the fragment alone -- main() is not re-executed -- so
+    # without this line nothing would advance while the operator sits idle,
+    # which is the whole point of run_every. Non-blocking (it starts a daemon
+    # thread) and throttled, so the cost is one cycle per _UNSUB_THROTTLE_S
+    # however often this renders.
+    try:
+        _kick_unsub_sync(force=False)
+    except Exception:
+        pass
+
+
+def _render_unsub_actions() -> None:
+    """Manual sync button, review queue and journal. Inside the expander."""
+    if _unsub_configured():
+        if st.button("🔄 Synchroniser maintenant", key="unsub_sync_now",
+                     use_container_width=True):
+            with st.spinner("Lecture de la boîte de désinscription…"):
+                # ignore the throttle AND the backoff: an operator pressing the
+                # button explicitly is asking us to try anyway.
+                _unsub_state["backoff"] = {}
+                info = _kick_unsub_sync(force=True, wait_s=_UNSUB_CYCLE_BUDGET_S + 5)
+            if info["error"]:
+                st.error(f"Relève en échec : {info['error']}")
+            st.rerun()
+        st.caption(
+            "La relève ne tourne que quand l'application est ouverte : "
+            "Streamlit met le conteneur en veille. Une synchronisation est "
+            "**forcée juste avant chaque envoi**, ce qui est le moment qui compte."
+        )
+
+    pending = _unsub_pending_review()
+    if pending:
+        st.warning(f"⚠️ {len(pending)} message(s) à trancher à la main")
+        for cand in pending:
+            target = cand.review_hint or cand.email
+            st.caption(f"**{target or '(aucune adresse)'}** — {cand.why}")
+            st.caption(f"« {cand.subject[:90]} » de {cand.from_addr}")
+            if target and "," not in target:
+                # Keyed by ADDRESS, not by position. Streamlit matches a click
+                # to a widget key on the NEXT rerun, so a positional key would
+                # let a sweep finishing in between shift the list and attach
+                # the click to a different address -- and suppression cannot be
+                # undone.
+                if st.button(f"➕ Désinscrire {target}",
+                             key=f"unsub_review_{cand.mailbox}_{cand.uid}_{target}",
+                             use_container_width=True):
+                    if add_suppression(target, reason="revue_manuelle",
+                                       nom=cand.display_name,
+                                       provenance=unsubscribe_inbox.provenance_lines(cand)):
+                        st.success(f"{target} ajoutée.")
+                        st.rerun()
+                    else:
+                        st.error(_suppression_state["last_write_error"] or "échec Notion")
+
+    if _unsub_state["journal"]:
+        with st.expander("Journal de la relève (mémoire)"):
+            # The container sleeps and this ring is lost with it, so offer the
+            # export. The durable copy lives in the Streamlit Cloud logs.
+            lines = list(_unsub_state["journal"])
+            for entry in reversed(lines[-15:]):
+                st.caption(json.dumps(entry, ensure_ascii=False)[:220])
+            st.download_button(
+                "⬇️ Exporter le journal (JSON)",
+                data=json.dumps(lines, ensure_ascii=False, indent=1),
+                file_name="journal_desinscriptions.json",
+                mime="application/json",
+                key="unsub_journal_dl",
+            )
+
+
+# Auto-refreshing status: re-runs only itself, so a sleeping operator still sees
+# the sweep advance. Capability-detected so a streamlit downgrade degrades to a
+# plain (non-refreshing) call instead of an AttributeError at import time.
+if hasattr(st, "fragment"):
+    _unsub_status_fragment = st.fragment(run_every=_UNSUB_THROTTLE_S)(
+        _render_unsub_status)
+else:                                            # pragma: no cover
+    _unsub_status_fragment = _render_unsub_status
+
+
+def _presend_notice(key: str = "send") -> bool:
+    """Render the pre-send state and return whether sending may start.
+
+    Rendered on EVERY rerun, above the send buttons, and NOT inside a button
+    handler: a click is transient, so a retry button or an override checkbox
+    placed inside a handler would vanish on the very rerun the checkbox
+    triggers, and could never take effect. The buttons are disabled instead.
+    """
+    gate, msg = _suppression_gate(_suppression_state)
+    if gate == "block":
+        st.error(msg)
+        cols = st.columns([1, 2])
+        with cols[0]:
+            if st.button("🔄 Réessayer Notion", key=f"presend_retry_{key}"):
+                _force_suppression_reload()
+                _load_suppression()
+                st.rerun()
+        with cols[1]:
+            override = st.checkbox(
+                "Je confirme envoyer SANS liste de désinscription vérifiée",
+                key=f"presend_override_{key}",
+            )
+        if override:
+            st.warning(
+                "Envoi débloqué manuellement, sans liste vérifiée. "
+                "Cette décision est journalisée."
+            )
+        return bool(override)
+    if gate == "warn" and msg:
+        st.warning(msg)
+    return True
+
+
+def _presend_sync(sender_email: Optional[str] = None) -> None:
+    """Force a sweep as the first thing a send handler does.
+
+    This is what makes the invariant true: no send starts without a sync
+    attempt having just happened. It costs a couple of seconds inside a handler
+    where the operator is already waiting (the send loop itself sleeps 1 to 10 s
+    per email).
+
+    It NEVER blocks the send. The asymmetry is deliberate: Notion is the truth
+    used to filter, so a Notion outage stops the send (see _presend_notice);
+    IMAP is only an ingestion convenience, so an IMAP outage warns. Blocking on
+    IMAP would be worse than the disease, since one wrong Gmail app password
+    would freeze every campaign.
+
+    It works without touching the send loops because they re-test
+    is_suppressed() per contact, and add_suppression() has already updated the
+    in-memory cache: an address discovered 200 ms ago is honoured within the
+    same click, and counted in the skipped_suppressed_count already displayed.
+    """
+    if _suppression_gate(_suppression_state)[0] == "block":
+        # We only get here when the operator ticked the override box.
+        _unsub_journal("gate_override", sender=sender_email or "",
+                       why=str(_suppression_state.get("last_error_msg", ""))[:200])
+    if not _unsub_configured():
+        return
+    with st.spinner("Vérification des désinscriptions…"):
+        info = _kick_unsub_sync(force=True, wait_s=_UNSUB_PRESEND_WAIT_S,
+                                sender_email=sender_email)
+    if info.get("added"):
+        st.info(
+            f"🚫 {info['added']} désinscription(s) relevée(s) à l'instant — "
+            "elles sont déjà exclues de cet envoi."
+        )
+    if info.get("error") and not info.get("ok"):
+        st.warning(
+            f"⚠️ Relève des désinscriptions indisponible ({str(info['error'])[:160]}). "
+            "L'envoi continue sur la base de la liste Notion, qui reste la référence."
+        )
+    elif info.get("running"):
+        st.warning(
+            f"⚠️ La relève n'a pas fini en {int(_UNSUB_PRESEND_WAIT_S)} s. "
+            "L'envoi continue sur la liste Notion connue."
+        )
 
 
 def parse_email_list(raw: str) -> List[str]:
@@ -1285,6 +2204,25 @@ def _ensure_unsubscribe_footer(html: str) -> str:
 # List-Unsubscribe-Post / Reply-To headers (F1), guarantees the footer (F2),
 # and handles inline images + attachments.
 
+def _filter_cc(cc_emails: str) -> List[str]:
+    """CC addresses minus anyone on the suppression list.
+
+    The CC path bypassed is_suppressed() entirely: send_one_email() did
+    recipients.extend(...) straight from the raw string, so a suppressed
+    address in copy was mailed anyway. A CC is usually a colleague, but if one
+    is on the list the send is a violation. Used by BOTH the Cc header and the
+    SMTP envelope, so the two can never disagree.
+    """
+    if not cc_emails or not cc_emails.strip():
+        return []
+    kept = []
+    for raw in cc_emails.split(','):
+        addr = raw.strip()
+        if addr and not is_suppressed(addr):
+            kept.append(addr)
+    return kept
+
+
 def _build_email_message(
     sender_email: str,
     email_data: dict,
@@ -1302,8 +2240,11 @@ def _build_email_message(
         'personalized_subject', 'MERCI RAYMOND - Votre service paysagiste'
     )
 
-    if cc_emails and cc_emails.strip():
-        msg_root['Cc'] = cc_emails.strip()
+    _cc_kept = _filter_cc(cc_emails)
+    if _cc_kept:
+        # Rebuilt from the filtered list so the header cannot advertise a
+        # recipient the envelope no longer carries.
+        msg_root['Cc'] = ', '.join(_cc_kept)
 
     # F1 — Deliverability headers (RFC 8058 + RFC 2369).
     # mailto: only for now; an HTTPS one-click endpoint can be added later.
@@ -1315,6 +2256,23 @@ def _build_email_message(
 
     # F2 — Make sure the footer is always there, even on hand-edited HTML.
     html_body = _ensure_unsubscribe_footer(email_data['personalized_email'])
+
+    # F4 — Put the recipient's address in the VISIBLE footer link too.
+    # UNSUBSCRIBE_FOOTER_HTML is a module constant, so it is built without any
+    # address, while the List-Unsubscribe header above carries one. Result: a
+    # click on Gmail's Unsubscribe button (which uses the header) tells us who
+    # to unsubscribe, and a click on the visible link does not -- we fall back
+    # to the sender of the incoming mail. If the email had been forwarded, that
+    # is the wrong person. The closing quote anchors the replacement on the
+    # whole href, and UNSUBSCRIBE_FOOTER_MARKER survives it, so
+    # _ensure_unsubscribe_footer() stays idempotent.
+    # Note this uses email_data['email'], which in test mode is the SENDER's
+    # address, not the prospect's: a click on a test email must never be able
+    # to unsubscribe a real prospect.
+    html_body = html_body.replace(
+        f'mailto:{UNSUBSCRIBE_MAILTO}?subject=unsubscribe"',
+        f'mailto:{UNSUBSCRIBE_MAILTO}?subject=unsubscribe%20{email_data["email"]}"',
+    )
 
     alt = MIMEMultipart('alternative')
     msg_root.attach(alt)
@@ -1381,9 +2339,7 @@ def send_one_email(
         decorative_image_file_2=decorative_image_file_2,
     )
     text = msg_root.as_string()
-    recipients = [email_data['email']]
-    if cc_emails and cc_emails.strip():
-        recipients.extend([e.strip() for e in cc_emails.split(',') if e.strip()])
+    recipients = [email_data['email']] + _filter_cc(cc_emails)
     server.sendmail(sender_email, recipients, text)
 
 
@@ -1543,29 +2499,36 @@ def main():
         sender_email = None
         sender_password = None
 
-    # --- Deliverability sidebar widget (F3) -------------------------------
+    # --- Deliverability sidebar widget (F3 + F4) --------------------------
     # Suppression list — source of truth is the Notion DB plugged via
-    # SUPPRESSION_NOTION_DS_ID. UI here only lets the team append addresses
-    # received in the desinscription@ mailbox. No remove path: the team rule
-    # is that suppressed = forever (Notion is editable directly if rare manual
-    # corrections are needed).
+    # SUPPRESSION_NOTION_DS_ID. The team can append addresses by hand, and the
+    # F4 sweep appends them automatically from the desinscription@ mailbox.
+    # No remove path: the team rule is that suppressed = forever (Notion is
+    # editable directly if rare manual corrections are needed).
     st.sidebar.divider()
     st.sidebar.subheader("📬 Délivrabilité")
+    with st.sidebar:
+        # A fragment re-runs ITSELF every run_every seconds without a full
+        # script rerun, so the status advances while the operator sits idle,
+        # and it is a normal script context (st.* is safe inside).
+        # Capability-detected: pinned streamlit is 1.58, st.fragment landed in
+        # 1.37, but a downgrade must degrade to a plain call, not crash.
+        try:
+            _unsub_status_fragment()
+        except Exception:
+            _render_unsub_status()
     with st.sidebar.expander("🚫 Gestion des désinscriptions"):
-        if not SUPPRESSION_NOTION_DS_ID:
-            st.warning(
-                "⚠️ `SUPPRESSION_NOTION_DS_ID` non configuré dans `secrets.toml`. "
-                "La liste de désinscription est désactivée tant qu'aucun ID n'est plugué."
-            )
+        _render_unsub_actions()
+
         # Surface the success banner from the previous run (set by the form
         # handler below, then we st.rerun() so the counter refreshes from Notion).
         # pop() shows it once and clears the flag, so it doesn't stick forever.
         _added_count = st.session_state.pop('_suppression_add_success', None)
         if _added_count:
             st.success(f"✅ {_added_count} adresse(s) ajoutée(s) à Notion.")
-
-        current_suppression = _load_suppression()
-        st.caption(f"{len(current_suppression)} adresse(s) dans la liste de désinscription (Notion).")
+        _dup_count = st.session_state.pop('_suppression_add_duplicates', None)
+        if _dup_count:
+            st.info(f"{_dup_count} adresse(s) étaient déjà dans la liste.")
 
         # Use a form so clear_on_submit handles the text_area reset for us —
         # writing to st.session_state['suppression_add_input'] manually fails
@@ -1581,17 +2544,46 @@ def main():
 
         if submitted:
             parsed = parse_email_list(new_unsubs)
+            # Cap the batch: this loop used to call add_suppression() per
+            # address with no shared resolution and no breaker, so pasting a
+            # long list against a hanging Notion froze the rerun for minutes.
+            _MANUAL_ADD_CAP = 50
+            if len(parsed) > _MANUAL_ADD_CAP:
+                st.warning(
+                    f"{len(parsed)} adresses collées : seules les "
+                    f"{_MANUAL_ADD_CAP} premières sont traitées. Recommencez "
+                    "pour les suivantes."
+                )
+                parsed = parsed[:_MANUAL_ADD_CAP]
+            known = _load_suppression()          # one read, not one per address
+            _resolve_suppression_ds_id()         # one resolution, not one per address
             added = 0
+            duplicates = 0
+            failed = []
             for e in parsed:
-                if add_suppression(e, reason="manual_unsubscribe"):
+                if e in known:
+                    duplicates += 1
+                elif add_suppression(e, reason="manual_unsubscribe"):
                     added += 1
-            if added:
-                # Stash the count and rerun; the banner block above re-renders
-                # the success message on the next pass with a fresh counter.
+                else:
+                    failed.append(e)
+            if failed:
+                # One aggregated error carrying Notion's own words, instead of
+                # one st.error per address saying only "400 Bad Request".
+                st.error(
+                    "%d adresse(s) refusée(s) par Notion (%s%s). Détail : %s"
+                    % (len(failed), ", ".join(failed[:3]),
+                       "…" if len(failed) > 3 else "",
+                       _suppression_state["last_write_error"] or "cause inconnue")
+                )
+            if added or duplicates:
+                # Stash the counts and rerun; the banner block above re-renders
+                # the message on the next pass with a fresh counter.
                 st.session_state['_suppression_add_success'] = added
+                st.session_state['_suppression_add_duplicates'] = duplicates
                 st.rerun()
-            else:
-                st.warning("Aucune adresse email valide détectée (ou échec Notion — vérifier le log ci-dessus).")
+            elif not failed:
+                st.warning("Aucune adresse email valide détectée.")
     # ----------------------------------------------------------------------
 
     # Add user from UI
@@ -2386,6 +3378,11 @@ def main():
             if suppressed_in_batch > 0:
                 st.info(f"🚫 {suppressed_in_batch} destinataire(s) ignoré(s) (présents dans la liste de désinscription)")
 
+            # F4 — One gate for both send buttons below (they share this scope).
+            # Rendered here rather than inside either handler so the retry
+            # button and the override checkbox survive the reruns they cause.
+            _send_allowed = _presend_notice()
+
             # Show status if some emails were already sent
             if already_sent_count > 0 and len(remaining_emails) > 0:
                 st.info(f"📊 **Progrès:** {already_sent_count} emails déjà envoyés. {len(remaining_emails)} emails restants à envoyer.")
@@ -2536,7 +3533,10 @@ def main():
                                 st.write(f"📋 **CC:** {', '.join(cc_list)}")
 
                         # Send button
-                        if st.button("📤 Envoyer les emails corrigés", type="primary", key="send_invalid"):
+                        if st.button("📤 Envoyer les emails corrigés", type="primary",
+                                     key="send_invalid", disabled=not _send_allowed):
+                            # First statement of the handler, before any smtplib call.
+                            _presend_sync(sender_email)
                             progress_bar_invalid = st.progress(0)
                             status_text_invalid = st.empty()
 
@@ -2661,7 +3661,10 @@ def main():
                             st.write(f"📋 **CC:** {', '.join(cc_list)}")
 
                     # Send emails - FIXED VERSION
-                    if st.button("📤 Envoyer tous les emails", type="primary"):
+                    if st.button("📤 Envoyer tous les emails", type="primary",
+                                 disabled=not _send_allowed):
+                        # First statement of the handler, before any smtplib call.
+                        _presend_sync(sender_email)
                         progress_bar = st.progress(0)
                         status_text = st.empty()
 
@@ -2784,6 +3787,17 @@ def main():
                 st.info("Aucun email valide prêt à envoyer.")
         else:
             st.info("Veuillez d'abord traiter les emails dans l'onglet Personnalisation.")
+
+    # F4 — Opportunistic sweep, at the very END of main(): the page is already
+    # painted when the IMAP connection starts, and the result shows on the next
+    # render. Non-blocking anyway (it only starts a daemon thread), throttled to
+    # one cycle per _UNSUB_THROTTLE_S whatever the number of reruns, and wrapped
+    # because a failed sweep must never be able to break the page.
+    try:
+        _kick_unsub_sync(force=False)
+    except Exception:
+        pass
+
 
 if __name__ == "__main__":
     main()
