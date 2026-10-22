@@ -72,6 +72,19 @@ unsub = {
     "journal": collections.deque(maxlen=UNSUB_JOURNAL_MAXLEN),
 }
 
+#: Senders added from the app, read from the Notion "Expéditeurs Raymographe"
+#: database. Same TTL + circuit breaker shape as the suppression cache, for
+#: the same reason: _load_users() runs on every rerun AND from the IMAP worker.
+senders = {
+    "data": [],             # [{"name", "email", "password", "page_id"}], decrypted
+    "undecryptable": [],    # names whose token the current key cannot open
+    "last_fetch": 0.0,
+    "loaded_ever": False,
+    "last_error": 0.0,      # arms the breaker
+    "last_error_msg": "",
+    "schema": None,         # {property_name: property_type}
+}
+
 #: Guards the copy-on-write updates of suppression["data"], which the sweep
 #: thread writes while reruns iterate it.
 suppression_lock = threading.Lock()
@@ -84,7 +97,12 @@ imap_lock = threading.Lock()
 
 
 def reset_for_tests() -> None:
-    """Put both dicts back to a pristine state. Tests only."""
+    """Put every dict back to a pristine state. Tests only."""
+    senders.update({
+        "data": [], "undecryptable": [], "last_fetch": 0.0,
+        "loaded_ever": False, "last_error": 0.0, "last_error_msg": "",
+        "schema": None,
+    })
     suppression.update({
         "data": {}, "last_fetch": 0.0, "resolved_ds_id": None,
         "resolve_failed_at": 0.0, "loaded_ever": False, "last_error": 0.0,

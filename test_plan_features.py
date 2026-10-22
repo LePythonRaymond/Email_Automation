@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Tests for plan features: to_name_case, user load/save, CSV load.
+Tests for plan features: to_name_case, user load, CSV load.
+(Adding a sender from the form is covered by test_senders_store.py.)
 Run from project root: python test_plan_features.py
 """
 
@@ -16,8 +17,6 @@ import pandas as pd
 from email_automation_app import (
     to_name_case,
     _load_users,
-    _append_user_to_file,
-    _users_file_path,
     EmailAutomation,
 )
 
@@ -80,37 +79,16 @@ def test_name_value_columns_prenom_nom():
 
 
 def test_load_users_no_file():
-    """_load_users returns base list when users.json is missing (or we use a temp path)."""
-    # We cannot remove users.json if it exists; just check that with a missing path we get base.
-    # Actually _load_users uses _users_file_path() which is fixed. So we test: load returns a list
-    # with at least the base users.
-    users = _load_users()
+    """_load_users returns at least the [users] blocks of the secrets. The
+    Notion part is stubbed out: this test must not depend on the network."""
+    from unittest.mock import patch
+    with patch("email_automation_app._load_app_senders", return_value=[]):
+        users = _load_users()
     assert isinstance(users, list)
     assert len(users) >= 5
     names = [u["name"] for u in users]
     assert "Hugo Meunier" in names
-    print("  _load_users (base or merged): OK")
-    return True
-
-
-def test_append_user_invalid():
-    """_append_user_to_file writes new user to file (use temp path to avoid polluting real users.json)."""
-    import tempfile
-    from pathlib import Path
-    from unittest.mock import patch
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-        f.write("[]")
-        tmp_path = f.name
-    try:
-        with patch("email_automation_app._users_file_path", return_value=Path(tmp_path)):
-            err = _append_user_to_file("Test User", "test@example.com", "secret")
-        assert err is None
-        with open(tmp_path) as f:
-            data = json.load(f)
-        assert len(data) == 1 and data[0]["name"] == "Test User" and data[0]["email"] == "test@example.com"
-    finally:
-        os.unlink(tmp_path)
-    print("  _append_user_to_file: OK")
+    print("  _load_users (secrets senders): OK")
     return True
 
 
@@ -142,7 +120,6 @@ def main():
         ("extract_contact_info name case", test_extract_contact_info_name_case),
         ("name_value_columns Prénom/Nom", test_name_value_columns_prenom_nom),
         ("_load_users", test_load_users_no_file),
-        ("_append_user_to_file", test_append_user_invalid),
         ("CSV loading", test_csv_loading),
     ]:
         try:

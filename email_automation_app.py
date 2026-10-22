@@ -25,6 +25,7 @@ from datetime import datetime, timedelta
 # into this module, so an import cycle is structurally impossible and
 # both can be tested without starting a Streamlit script run.
 import notion_props
+import senders_store
 import sync_state
 import unsubscribe_inbox
 
@@ -145,6 +146,30 @@ NOTION_DS_ID = "285d9278-02d7-808a-9395-000b04dfc654"
 SUPPRESSION_NOTION_DS_ID = _read_secret_or_env("SUPPRESSION_NOTION_DS_ID")
 NOTION_API_VERSION_LEGACY = "2022-06-28"
 NOTION_API_VERSION_DS = "2025-09-03"
+
+
+def _senders_store_secret(field: str, env_key: str) -> str:
+    """A [senders_store] field of the secrets, else a flat key / env var.
+
+    The section form is the documented one because it is order-proof: in TOML
+    a bare `KEY = "..."` pasted at the END of the secrets lands inside the last
+    [users.x] table, where nobody would look for it. A [section] header can
+    go anywhere.
+    """
+    try:
+        return str(st.secrets["senders_store"][field]).strip()
+    except Exception:
+        return _read_secret_or_env(env_key).strip()
+
+
+# Senders added from the app ("Ajouter un utilisateur"), stored in the Notion
+# database "Expéditeurs Raymographe" (child of the Raymographe page, created by
+# and shared with the same integration as NOTION_API_KEY). Data source ID, not
+# database ID. Passwords there are encrypted with SENDERS_ENCRYPTION_KEY; see
+# senders_store.py for the why and the format.
+SENDERS_NOTION_DS_ID = (_senders_store_secret("notion_ds_id", "SENDERS_NOTION_DS_ID")
+                        or "b8b61161-20d2-471e-bc51-0e8307df31b7")
+SENDERS_ENCRYPTION_KEY = _senders_store_secret("encryption_key", "SENDERS_ENCRYPTION_KEY")
 
 # --- Unsubscribe mailbox sync (F4) — configuration --------------------------
 # desinscription@merciraymond.fr is an ALIAS: it redirects into a real person's
@@ -982,11 +1007,6 @@ def calculate_sending_time(num_emails: int, delay_seconds: int) -> str:
         return f"{minutes}min"
 
 
-def _users_file_path() -> Path:
-    """Path to users.json in project root (same directory as this script)."""
-    return Path(__file__).resolve().parent / "users.json"
-
-
 def _load_users_from_secrets() -> List[Dict[str, str]]:
     """Load senders from st.secrets['users'] (.streamlit/secrets.toml). Returns [] if missing."""
     try:
@@ -1007,34 +1027,225 @@ def _load_users_from_secrets() -> List[Dict[str, str]]:
 
 
 def _load_users() -> List[Dict[str, str]]:
-    """Load senders: from st.secrets first, then users.json (no duplicates by email).
-    Returns [] if neither source is configured — the caller surfaces a friendly warning."""
-    base = _load_users_from_secrets()
-    path = _users_file_path()
-    if not path.exists():
-        return base
+    """All senders: the [users] blocks of st.secrets first, then the ones added
+    from the app and kept in Notion. No duplicates by email, secrets winning.
+    Returns [] if neither source is configured; the caller shows a warning.
+
+    users.json is gone: it lived on the container disk, which Streamlit Cloud
+    wipes at every restart, so anything added through the form was temporary.
+    """
+    return senders_store.merge_senders(_load_users_from_secrets(), _load_app_senders())
+
+
+# --- Senders added from the app (persistent) ----------------------------------
+# Read path: _load_app_senders(), a TTL cache with a circuit breaker, because
+# _load_users() runs on every rerun and from the IMAP worker thread. Same
+# lesson as the suppression list (June 2026): a Notion that hangs must never
+# freeze the sidebar, so a failure is remembered for a minute and the last
+# good copy is served meanwhile.
+# Write path: add_app_sender(), called by the form only. It re-reads Notion
+# first (never upserts against a stale cache) and only stores a password that
+# Gmail has just accepted.
+
+_SENDERS_CACHE_TTL_S = 300      # a row deleted in Notion disappears within 5 min
+_SENDERS_ERROR_TTL_S = 60       # breaker window after a failed read
+_SENDERS_HTTP_TIMEOUT_S = 8
+_SENDER_VERIFY_TIMEOUT_S = 15   # Gmail SMTP login check in the form
+
+# Held in sync_state for the reason explained above _suppression_state: this
+# module's top level is re-executed in a fresh namespace on every rerun.
+_senders_state = sync_state.senders
+
+
+def _senders_cipher():
+    """(Fernet cipher, "") when the store is usable, else (None, why)."""
+    if not NOTION_API_KEY:
+        return None, "NOTION_API_KEY absent des secrets"
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            extra = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return base
-    if not isinstance(extra, list):
-        return base
-    seen = {u["email"].strip().lower() for u in base}
-    out = list(base)
-    for u in extra:
-        if not isinstance(u, dict):
-            continue
-        name = (u.get("name") or "").strip()
-        email = (u.get("email") or "").strip()
-        password = (u.get("password") or "").strip()
-        if not name or not email:
-            continue
-        if email.lower() in seen:
-            continue
-        seen.add(email.lower())
-        out.append({"name": name, "email": email, "password": password})
-    return out
+        return senders_store.make_cipher(SENDERS_ENCRYPTION_KEY), ""
+    except senders_store.SenderKeyError as exc:
+        return None, str(exc)
+
+
+def _senders_schema() -> dict:
+    """{property_name: property_type} of the senders database. Normally read
+    off the rows; this GET is only needed while the database is still empty."""
+    if _senders_state["schema"]:
+        return _senders_state["schema"]
+    resp = requests.get(
+        f"https://api.notion.com/v1/data_sources/{SENDERS_NOTION_DS_ID}",
+        headers=_notion_headers(), timeout=_SENDERS_HTTP_TIMEOUT_S,
+    )
+    resp.raise_for_status()
+    _senders_state["schema"] = notion_props.schema_from_data_source(resp.json())
+    return _senders_state["schema"]
+
+
+def _fetch_senders_from_notion(cipher) -> Tuple[List[dict], List[dict]]:
+    """(senders with clear passwords, rows this key cannot decrypt).
+    Both carry name, email and page_id; the second list has no password. It is
+    kept rather than dropped so that re-entering such a sender in the form
+    updates its row instead of creating a duplicate.
+    Raises on network / auth errors so the caller keeps the last good copy."""
+    url = f"https://api.notion.com/v1/data_sources/{SENDERS_NOTION_DS_ID}/query"
+    senders, undecryptable = [], []
+    start_cursor = None
+    while True:
+        # Oldest first, so the dropdown order is stable and follows additions.
+        body = {"page_size": 100,
+                "sorts": [{"timestamp": "created_time", "direction": "ascending"}]}
+        if start_cursor:
+            body["start_cursor"] = start_cursor
+        resp = requests.post(url, headers=_notion_headers(), json=body,
+                             timeout=_SENDERS_HTTP_TIMEOUT_S)
+        if resp.status_code == 404:
+            raise RuntimeError(
+                "base des expéditeurs introuvable : vérifiez qu'elle est toujours "
+                "partagée avec l'intégration Notion et que l'ID est le bon"
+            )
+        resp.raise_for_status()
+        payload = resp.json()
+        results = payload.get("results", [])
+        if results:
+            _senders_state["schema"] = notion_props.schema_from_page(results[0])
+        for page in results:
+            row = senders_store.parse_sender_page(page)
+            if row is None:
+                continue
+            sender = {"name": row["name"], "email": row["email"],
+                      "page_id": row["page_id"]}
+            password = senders_store.decrypt_password(cipher, row["token"])
+            if password is None:
+                undecryptable.append(sender)
+                continue
+            sender["password"] = password
+            senders.append(sender)
+        if payload.get("has_more"):
+            start_cursor = payload.get("next_cursor")
+        else:
+            break
+    return senders, undecryptable
+
+
+def _load_app_senders(now: Optional[float] = None) -> List[dict]:
+    """Senders kept in Notion, from the cache when it is fresh enough."""
+    now = time.time() if now is None else now
+    cipher, _why = _senders_cipher()
+    if cipher is None:
+        return []
+    if _senders_state["last_error"] and (
+        now - _senders_state["last_error"]
+    ) < _SENDERS_ERROR_TTL_S:
+        return _senders_state["data"]
+    if _senders_state["loaded_ever"] and (
+        now - _senders_state["last_fetch"]
+    ) < _SENDERS_CACHE_TTL_S:
+        return _senders_state["data"]
+    try:
+        senders, undecryptable = _fetch_senders_from_notion(cipher)
+    except Exception as exc:
+        _senders_state["last_error"] = now
+        _senders_state["last_error_msg"] = f"{exc.__class__.__name__}: {exc}"[:300]
+        return _senders_state["data"]
+    _senders_state.update({
+        "data": senders, "undecryptable": undecryptable, "last_fetch": now,
+        "loaded_ever": True, "last_error": 0.0, "last_error_msg": "",
+    })
+    return senders
+
+
+def _verify_gmail_login(email: str, password: str) -> Optional[str]:
+    """Log in to Gmail SMTP with these credentials, then log out. Nothing is
+    sent. None when Gmail accepts them, else the reason, in French."""
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT,
+                          timeout=_SENDER_VERIFY_TIMEOUT_S) as server:
+            server.starttls()
+            server.login(email, password)
+    except smtplib.SMTPAuthenticationError:
+        return (
+            f"Gmail refuse ce mot de passe pour {email}. Il faut un mot de passe "
+            "d'application (16 lettres, créé sur myaccount.google.com/apppasswords), "
+            "pas le mot de passe habituel du compte. Rien n'a été enregistré."
+        )
+    except (smtplib.SMTPException, OSError) as exc:
+        return (f"Impossible de joindre Gmail pour vérifier le mot de passe "
+                f"({exc.__class__.__name__}). Rien n'a été enregistré, réessayez.")
+    return None
+
+
+def add_app_sender(name: str, email: str, password: str) -> Tuple[Optional[str], str]:
+    """Create or update one sender in Notion. Returns (error, "") on failure,
+    (None, "ajouté" | "mis à jour") on success. Order matters:
+      1. fresh read of Notion, so an existing row is updated, never duplicated;
+      2. pure checks (missing fields, address already in the secrets, name taken);
+      3. Gmail login check, so a mistyped password is never stored;
+      4. write, then the cache is updated in place (no 5-minute wait).
+    """
+    name, email, password = name.strip(), email.strip(), password.strip()
+    cipher, why = _senders_cipher()
+    if cipher is None:
+        return f"Stockage permanent indisponible : {why}.", ""
+    try:
+        current, undecryptable = _fetch_senders_from_notion(cipher)
+    except Exception as exc:
+        return f"Notion injoignable, rien n'a été enregistré ({exc}).", ""
+    err = senders_store.validate_new_sender(
+        name, email, password, _load_users_from_secrets(), current)
+    if err:
+        return err, ""
+    err = _verify_gmail_login(email, password)
+    if err:
+        return err, ""
+
+    try:
+        props = senders_store.build_sender_properties(
+            _senders_schema(), name, email,
+            senders_store.encrypt_password(cipher, password))
+    except (notion_props.NotionSchemaError, requests.RequestException) as exc:
+        return f"Base des expéditeurs illisible ({exc}).", ""
+    existing = next((s for s in current + undecryptable
+                     if s["email"].lower() == email.lower()), None)
+    try:
+        if existing:
+            resp = requests.patch(
+                f"https://api.notion.com/v1/pages/{existing['page_id']}",
+                headers=_notion_headers(), json={"properties": props},
+                timeout=_SENDERS_HTTP_TIMEOUT_S,
+            )
+        else:
+            resp = requests.post(
+                "https://api.notion.com/v1/pages", headers=_notion_headers(),
+                json={"parent": {"type": "data_source_id",
+                                 "data_source_id": SENDERS_NOTION_DS_ID},
+                      "properties": props},
+                timeout=_SENDERS_HTTP_TIMEOUT_S,
+            )
+    except requests.RequestException as exc:
+        return f"Notion injoignable, rien n'a été enregistré ({exc}).", ""
+    if resp.status_code >= 400:
+        # Notion's own words: the body names the offending property or right.
+        return f"Notion a refusé l'enregistrement : HTTP {resp.status_code} {resp.text[:300]}", ""
+
+    try:
+        new_id = (resp.json() or {}).get("id", "")
+    except ValueError:
+        new_id = ""   # saved in Notion all the same; only the cache lacks the id
+    saved = {"name": name, "email": email, "password": password,
+             "page_id": existing["page_id"] if existing else new_id}
+    # Write-through: an update keeps its place (Notion sorts by creation date,
+    # which a PATCH does not change), a creation goes last.
+    fresh = [saved if s["email"].lower() == email.lower() else s for s in current]
+    if saved not in fresh:
+        fresh.append(saved)
+    _senders_state.update({
+        "data": fresh,
+        "undecryptable": [s for s in undecryptable
+                          if s["email"].lower() != email.lower()],
+        "last_fetch": time.time(), "loaded_ever": True,
+        "last_error": 0.0, "last_error_msg": "",
+    })
+    return None, ("mis à jour" if existing else "ajouté")
 
 
 # --- Suppression list (F3) -------------------------------------------------
@@ -2343,27 +2554,6 @@ def send_one_email(
     server.sendmail(sender_email, recipients, text)
 
 
-def _append_user_to_file(name: str, email: str, password: str) -> Optional[str]:
-    """Append one user to users.json. Returns None on success, error message on failure."""
-    path = _users_file_path()
-    extra = []
-    if path.exists():
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                extra = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            pass
-        if not isinstance(extra, list):
-            extra = []
-    extra.append({"name": name.strip(), "email": email.strip(), "password": password.strip()})
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(extra, f, ensure_ascii=False, indent=2)
-    except OSError as e:
-        return str(e)
-    return None
-
-
 # --- Saved uploads (images/files) for reuse ---
 UPLOADED_ASSETS_DIR = Path(__file__).resolve().parent / "uploaded_assets"
 DECORATIVE_SUBDIR = "decorative"
@@ -2459,10 +2649,11 @@ def main():
     # Sidebar for user selection
     st.sidebar.header("👤 Choisissez un Utilisateur")
 
-    if st.session_state.pop("user_just_added_notice", False):
-        st.sidebar.success("✅ Utilisateur ajouté avec succès — vous êtes maintenant sur ce profil.")
+    _added_notice = st.session_state.pop("user_just_added_notice", None)
+    if _added_notice:
+        st.sidebar.success(_added_notice)
         try:
-            st.toast("Utilisateur ajouté !", icon="✅")
+            st.toast("Utilisateur enregistré !", icon="✅")
         except Exception:
             pass
 
@@ -2471,6 +2662,14 @@ def main():
     # Create user selection dropdown
     user_options = [user["name"] for user in USERS]
     if user_options:
+        # A sender added by the form below is selected HERE, on the next run,
+        # before the selectbox exists. Streamlit refuses any write to a
+        # widget's key once that widget has been drawn in the current run:
+        # writing utilisateur_select from the form handler, after the
+        # selectbox, is what raised StreamlitAPIException.
+        _pending = st.session_state.pop("_pending_user_select", None)
+        if _pending in user_options:
+            st.session_state.utilisateur_select = _pending
         if (
             "utilisateur_select" in st.session_state
             and st.session_state.utilisateur_select not in user_options
@@ -2498,6 +2697,18 @@ def main():
         st.sidebar.warning("Aucun utilisateur configuré — ajoutez un bloc `[users.X]` à `.streamlit/secrets.toml` ou utilisez le formulaire ci-dessous.")
         sender_email = None
         sender_password = None
+
+    # Shown right under the dropdown because that is where a missing sender
+    # gets noticed; inside the collapsed "Ajouter" expander nobody would see it.
+    if _senders_state["last_error_msg"]:
+        st.sidebar.caption("⚠️ Expéditeurs ajoutés depuis l'app momentanément "
+                           f"absents (Notion injoignable) : {_senders_state['last_error_msg']}")
+    if _senders_state["undecryptable"]:
+        st.sidebar.caption(
+            "⚠️ Mot de passe illisible avec la clé actuelle (clé changée ?) pour : "
+            "%s. Ressaisissez-les dans « Ajouter un utilisateur »."
+            % ", ".join(s["name"] for s in _senders_state["undecryptable"])
+        )
 
     # --- Deliverability sidebar widget (F3 + F4) --------------------------
     # Suppression list — source of truth is the Notion DB plugged via
@@ -2586,30 +2797,45 @@ def main():
                 st.warning("Aucune adresse email valide détectée.")
     # ----------------------------------------------------------------------
 
-    # Add user from UI
+    # Add user from UI. Stored in Notion (password encrypted), so it survives
+    # restarts and redeploys; see add_app_sender() and senders_store.py.
     with st.sidebar.expander("➕ Ajouter un utilisateur"):
-        add_name = st.text_input("Nom", key="add_user_name", placeholder="Jean Dupont")
-        add_email = st.text_input("Email", key="add_user_email", placeholder="jean@exemple.fr")
-        add_password = st.text_input("Mot de passe (app password)", key="add_user_password", type="password", placeholder="xxxx xxxx xxxx xxxx")
-        if st.button("Ajouter"):
-            if not (add_name and add_email):
-                st.error("Nom et email sont obligatoires.")
+        _store_cipher, _store_why = _senders_cipher()
+        if _store_cipher is None:
+            st.warning(
+                f"Ajout désactivé : {_store_why}. Ajoutez la section "
+                "`[senders_store]` (clé `encryption_key`) aux secrets Streamlit."
+            )
+        else:
+            st.caption("Enregistré de façon permanente dans Notion, mot de passe "
+                       "chiffré. Gmail le vérifie avant l'enregistrement. Pour "
+                       "changer un mot de passe, ressaisissez le même email.")
+        # Emptied after a success, and BEFORE the inputs exist in this run:
+        # same Streamlit rule as utilisateur_select above.
+        if st.session_state.pop("_add_user_reset", False):
+            for k in ("add_user_name", "add_user_email", "add_user_password"):
+                st.session_state[k] = ""
+        # A form: typing does not rerun the whole app at each field, and
+        # Entrée submits. No clear_on_submit, so a refused entry stays on
+        # screen to be corrected instead of being retyped.
+        with st.form("add_user_form"):
+            add_name = st.text_input("Nom", key="add_user_name", placeholder="Jean Dupont")
+            add_email = st.text_input("Email", key="add_user_email", placeholder="jean@exemple.fr")
+            add_password = st.text_input("Mot de passe (app password)", key="add_user_password", type="password", placeholder="xxxx xxxx xxxx xxxx")
+            add_submitted = st.form_submit_button("Ajouter", disabled=_store_cipher is None)
+        if add_submitted:
+            with st.spinner("Vérification du mot de passe auprès de Gmail…"):
+                err, verb = add_app_sender(add_name or "", add_email or "", add_password or "")
+            if err:
+                st.error(err)
             else:
-                err = _append_user_to_file(add_name, add_email, add_password or "")
-                if err:
-                    st.error(f"Erreur: {err}")
-                else:
-                    new_name = add_name.strip()
-                    st.session_state.utilisateur_select = new_name
-                    st.session_state.user_just_added_notice = True
-                    for k in ("add_user_name", "add_user_email", "add_user_password"):
-                        if k in st.session_state:
-                            st.session_state[k] = ""
-                    try:
-                        st.balloons()
-                    except Exception:
-                        pass
-                    st.rerun()
+                st.session_state["_pending_user_select"] = add_name.strip()
+                st.session_state["_add_user_reset"] = True
+                st.session_state.user_just_added_notice = (
+                    f"✅ {add_name.strip()} : expéditeur {verb} dans Notion "
+                    "(permanent). Vous êtes maintenant sur ce profil."
+                )
+                st.rerun()
 
     # Main content
     tab1, tab2, tab3 = st.tabs(["📁 Upload & Preview", "🎨 Design Email", "🚀 Envoi"])
